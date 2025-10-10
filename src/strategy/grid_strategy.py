@@ -194,7 +194,7 @@ class GridStrategy:
         Args:
             current_price: Current market price
         """
-        self.logger.info(f"🔄 [{self.symbol}] Syncing positions with exchange...")
+        self.logger.debug(f"🔄 [{self.symbol}] Syncing positions with exchange...")
 
         for side in ['Buy', 'Sell']:
             # Check if we have local position tracked
@@ -223,7 +223,7 @@ class GridStrategy:
                     self._update_tp_order(side)
                 else:
                     # Both have position -> verify TP order exists and recover ID if lost
-                    self.logger.info(f"✅ [{self.symbol}] {side} position already synced")
+                    self.logger.debug(f"✅ [{self.symbol}] {side} position already synced")
 
                     # Check if we lost TP order ID after restart
                     current_tp_id = self.pm.get_tp_order_id(side)

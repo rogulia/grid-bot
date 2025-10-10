@@ -196,7 +196,7 @@ class BybitClient:
                 pos_size = float(pos.get('size', 0))
 
                 if pos_side == side and pos_size > 0:
-                    self.logger.info(
+                    self.logger.debug(
                         f"Found active {side} position: {pos_size} @ ${pos.get('avgPrice', 'N/A')}"
                     )
                     return pos
