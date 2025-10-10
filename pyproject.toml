@@ -1,0 +1,16 @@
+[project]
+name = "sol-trader"
+version = "0.1.0"
+description = "Automated Bybit Futures Trading Bot with Grid Strategy"
+requires-python = ">=3.9"
+dependencies = [
+    "pybit>=5.7.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0.0",
+    "pandas>=2.0.0",
+    "pytest>=8.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

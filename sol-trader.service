@@ -1,0 +1,30 @@
+[Unit]
+Description=SOL-Trader Bot - Automated Trading Bot for Bybit
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=iuriirogulia
+Group=iuriirogulia
+WorkingDirectory=/home/iuriirogulia/projects/sol-trader
+Environment="PATH=/home/iuriirogulia/projects/sol-trader/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+
+# Команда запуска
+ExecStart=/home/iuriirogulia/projects/sol-trader/.venv/bin/python /home/iuriirogulia/projects/sol-trader/src/main.py
+
+# Автоматический перезапуск при падении
+Restart=always
+RestartSec=10
+
+# Логирование
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sol-trader
+
+# Безопасность
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

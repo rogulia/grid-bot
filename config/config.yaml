@@ -1,0 +1,45 @@
+exchange:
+  name: "bybit"
+  # Demo Trading: true = виртуальные деньги ($50k USDT автоматически)
+  #               false = реальные деньги (ОСТОРОЖНО!)
+  # Работает только когда bot.dry_run = false
+  demo_trading: true
+  rest_url: "https://api-demo.bybit.com"
+  ws_public: "wss://stream.bybit.com/v5/public/linear"
+  ws_private: "wss://stream-demo.bybit.com/v5/private"
+
+# Мультивалютная торговля: можно добавить сколько угодно монет!
+# Каждая монета работает независимо со своими параметрами
+strategies:
+  # Стратегия #1: SOLUSDT
+  - symbol: "SOLUSDT"              # Торговая пара
+    category: "linear"             # USDT Perpetual
+    leverage: 100                  # Плечо 100x (ВЫСОКИЙ РИСК!)
+    initial_position_size_usd: 1.0 # МАРЖА в USD (плечо применяется автоматически!)
+    grid_step_percent: 1.0         # Шаг усреднения в %
+    averaging_multiplier: 2.0      # Мультипликатор размера позиции
+    take_profit_percent: 1.0       # Фиксация прибыли при отскоке на %
+    max_grid_levels_per_side: 10   # Максимум grid уровней
+
+  # Стратегия #2: DOGEUSDT
+  - symbol: "DOGEUSDT"
+    category: "linear"
+    leverage: 75                   # Более безопасное плечо для DOGE
+    initial_position_size_usd: 1.0 # МАРЖА в USD (плечо применяется автоматически!)
+    grid_step_percent: 1.0         # Шаг усреднения в %
+    averaging_multiplier: 2.0      # Мультипликатор размера позиции
+    take_profit_percent: 1.0       # Фиксация прибыли при отскоке на %
+    max_grid_levels_per_side: 10   # Максимум grid уровней
+
+risk_management:
+  max_total_exposure: 1000.0     # Максимум USDT в риске
+  liquidation_buffer: 0.5        # Закрывать позицию при 0.5% до ликвидации (для 100x leverage)
+  emergency_stop_loss: -500.0    # Аварийный стоп-лосс в USDT (50% от баланса)
+
+bot:
+  # Режим симуляции: true = только логи (никаких API вызовов)
+  #                  false = реальные API вызовы (к demo или production)
+  dry_run: false                 # ✅ ВКЛЮЧЕНА РЕАЛЬНАЯ ДЕМО ТОРГОВЛЯ
+
+  log_level: "INFO"              # DEBUG | INFO | WARNING | ERROR
+  price_check_interval: 1.0      # Интервал проверки WebSocket данных в секундах
