@@ -169,10 +169,14 @@ class PositionManager:
             side: 'Buy' (LONG) or 'Sell' (SHORT)
 
         Returns:
-            Total quantity
+            Total quantity (rounded to avoid floating point errors)
         """
         positions = self.long_positions if side == 'Buy' else self.short_positions
-        return sum(p.quantity for p in positions)
+        total = sum(p.quantity for p in positions)
+
+        # Round to 8 decimal places to avoid floating point errors like 2.4000000000000004
+        # For crypto, 8 decimals is standard precision
+        return round(total, 8)
 
     def calculate_pnl(self, current_price: float, side: Optional[str] = None) -> float:
         """

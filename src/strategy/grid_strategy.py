@@ -130,7 +130,20 @@ class GridStrategy:
         raw_qty = position_value_usd / price
 
         # Round to instrument's qty step
-        rounded_qty = round(raw_qty / self.qty_step) * self.qty_step
+        num_steps = round(raw_qty / self.qty_step)
+        rounded_qty = num_steps * self.qty_step
+
+        # Determine decimal places from qty_step to avoid floating point errors
+        # For step=0.1 -> 1 decimal, step=1.0 -> 0 decimals, step=0.01 -> 2 decimals
+        if self.qty_step >= 1:
+            decimal_places = 0
+        else:
+            # Count decimal places in qty_step
+            step_str = f"{self.qty_step:.10f}".rstrip('0')
+            decimal_places = len(step_str.split('.')[-1]) if '.' in step_str else 0
+
+        # Final rounding to exact precision (fixes 2.4000000000000004 -> 2.4)
+        rounded_qty = round(rounded_qty, decimal_places)
 
         # Ensure at least minimum quantity
         final_qty = max(rounded_qty, self.min_qty)
