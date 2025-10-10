@@ -1,6 +1,7 @@
 """Grid trading strategy with dual-sided hedging"""
 
 import logging
+import time
 from typing import Optional, TYPE_CHECKING
 from .position_manager import PositionManager
 from ..exchange.bybit_client import BybitClient
@@ -57,6 +58,15 @@ class GridStrategy:
 
         # Get instrument info from Bybit API
         self._load_instrument_info()
+
+        # Throttling for log messages (to avoid spam)
+        # Track last time each warning type was logged
+        self._last_warning_time = {
+            'max_exposure': 0,
+            'mm_rate': 0,
+            'liquidation': 0
+        }
+        self._warning_interval = 60  # Log warnings max once per 60 seconds
 
         self.logger.info(
             f"[{self.symbol}] Grid strategy initialized - Symbol: {self.symbol}, "
@@ -588,6 +598,35 @@ class GridStrategy:
             new_size = self._usd_to_qty(new_margin_usd, current_price)
             grid_level = self.pm.get_position_count(side)
 
+            # Check if we have enough available balance (use exchange data directly)
+            if not self.dry_run:
+                try:
+                    balance_info = self.client.get_wallet_balance(account_type="UNIFIED")
+                    if balance_info and 'list' in balance_info:
+                        for account in balance_info['list']:
+                            if account.get('accountType') == 'UNIFIED':
+                                available_balance = float(account.get('totalAvailableBalance', 0))
+
+                                # Check if we have enough balance for this order
+                                if new_margin_usd > available_balance:
+                                    # Throttle warning to avoid spam (max once per minute)
+                                    current_time = time.time()
+                                    warning_key = f'insufficient_balance_{side}'
+                                    if warning_key not in self._last_warning_time:
+                                        self._last_warning_time[warning_key] = 0
+
+                                    if current_time - self._last_warning_time[warning_key] >= self._warning_interval:
+                                        self.logger.warning(
+                                            f"⚠️ [{self.symbol}] Insufficient balance for {side} averaging: "
+                                            f"need ${new_margin_usd:.2f} MARGIN, available ${available_balance:.2f}"
+                                        )
+                                        self._last_warning_time[warning_key] = current_time
+                                    return  # Don't place order
+                                break
+                except Exception as e:
+                    self.logger.error(f"[{self.symbol}] Failed to check balance before order: {e}")
+                    return  # Don't place order if we can't verify balance
+
             self.logger.info(
                 f"[{self.symbol}] Executing grid order: {side} ${new_margin_usd:.2f} MARGIN ({new_size:.6f}) "
                 f"@ ${current_price:.4f} (level {grid_level})"
@@ -860,11 +899,14 @@ class GridStrategy:
         # Check Account Maintenance Margin Rate (for hedged positions)
         # This is the CORRECT way to check liquidation risk for LONG+SHORT strategy
         if not self.dry_run and account_mm_rate is not None:
-            # Log current MM rate for monitoring
+            # Log current MM rate for monitoring (throttled to avoid spam)
             if account_mm_rate > 50.0:  # Warning if > 50%
-                self.logger.warning(
-                    f"⚠️ Account Maintenance Margin Rate: {account_mm_rate:.2f}% (caution!)"
-                )
+                current_time = time.time()
+                if current_time - self._last_warning_time['mm_rate'] >= self._warning_interval:
+                    self.logger.warning(
+                        f"⚠️ [{self.symbol}] Account Maintenance Margin Rate: {account_mm_rate:.2f}% (caution!)"
+                    )
+                    self._last_warning_time['mm_rate'] = current_time
 
             # Emergency close if >= 90%
             if account_mm_rate >= 90.0:
@@ -889,17 +931,8 @@ class GridStrategy:
                     f"All positions closed. Review account and fix issues before restarting."
                 )
 
-        # Check total exposure
-        total_qty_long = self.pm.get_total_quantity('Buy')
-        total_qty_short = self.pm.get_total_quantity('Sell')
-        total_exposure = (total_qty_long + total_qty_short) * current_price
-
-        if total_exposure > self.max_exposure:
-            self.logger.warning(
-                f"⚠️ [{self.symbol}] Max exposure reached: ${total_exposure:.2f} > ${self.max_exposure:.2f}"
-            )
-            return False
-
+        # Balance check is now performed in _execute_grid_order() using totalAvailableBalance from exchange
+        # This is simpler and more accurate than calculating exposure manually
         return True
 
     def _emergency_close(self, side: str, current_price: float, reason: str):

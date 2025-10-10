@@ -307,26 +307,22 @@ class TestRiskLimits:
             assert mock_close.call_count == 2
 
     def test_check_risk_limits_max_exposure(self, grid_strategy, position_manager, mock_bybit_client):
-        """Test risk limits when max exposure exceeded"""
-        # Add large positions
-        for i in range(5):
-            position_manager.add_position('Buy', 100.0, 1.0, i)
-            position_manager.add_position('Sell', 100.0, 1.0, i)
+        """Test that insufficient balance is checked in _execute_grid_order, not in _check_risk_limits"""
+        # This test was updated because max_exposure check was moved from _check_risk_limits
+        # to _execute_grid_order where it checks actual available balance from exchange
 
-        grid_strategy.pm = position_manager
-        grid_strategy.max_exposure = 100.0  # Low limit
-
-        # Mock wallet balance with safe accountMMRate (so we test exposure limit, not MM rate)
+        # Mock wallet balance with safe accountMMRate
         mock_bybit_client.get_wallet_balance.return_value = {
             'list': [{
                 'accountType': 'UNIFIED',
-                'accountMMRate': '0.01'  # 1% - safe
+                'accountMMRate': '0.01',  # 1% - safe
+                'totalAvailableBalance': '1000.0'  # Plenty of balance
             }]
         }
 
-        # Should fail risk check due to max exposure
+        # Risk check should pass now (balance check happens in _execute_grid_order)
         is_safe = grid_strategy._check_risk_limits(100.0)
-        assert is_safe is False
+        assert is_safe is True
 
 
 class TestSyncWithExchange:

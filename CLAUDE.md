@@ -76,7 +76,8 @@ Every log message includes `[{self.symbol}]` prefix for multi-symbol trading cla
 - **Averaging**: New positions added at grid levels when price moves grid_step_percent against side
 - **Sizing**: Each new position is sized using `current_total_qty * (multiplier - 1)`
 - **Exit**: All positions on a side close together when weighted average entry price shows take_profit_percent gain
-- **Emergency Close**: Positions close if liquidation distance < liquidation_buffer or exposure > max_exposure
+- **Emergency Close**: Positions close if Account MM Rate >= 90%
+- **Balance Check**: Before each averaging, bot checks `totalAvailableBalance` from exchange to ensure sufficient margin
 
 ### Critical Risk Management
 
@@ -187,8 +188,8 @@ Bot supports trading multiple symbols simultaneously. Each symbol has independen
 - `max_grid_levels_per_side`: Maximum averaging levels
 
 **Risk parameters (global for all symbols):**
-- `max_total_exposure`: Maximum total position margin in USD (default: float('inf') - unlimited)
-- `liquidation_buffer`: Emergency close when distance to liqPrice < this % (default: 0.5%)
+- `max_total_exposure`: **DEPRECATED** - No longer used. Balance checks use `totalAvailableBalance` from exchange directly before each order
+- `liquidation_buffer`: **DEPRECATED** - Liquidation risk now managed via Account MM Rate (emergency close at 90%)
 - `emergency_stop_loss`: Total PnL loss trigger (not currently implemented)
 
 **Bot modes:**
@@ -279,7 +280,7 @@ Core libraries:
 2. **Funding rate**: Holding both LONG and SHORT incurs funding rate on both sides (small net cost).
 3. **Commission accumulation**: Frequent averaging can accumulate taker fees (~0.055% on Bybit). Use limit orders where possible (not currently implemented).
 4. **No partial closes**: Positions close all-or-nothing per side. No gradual exit strategy.
-5. **No symbol-specific risk limits**: `max_total_exposure` is global for all symbols, not per-symbol.
+5. **Balance checks use shared account balance**: All symbols share the same `totalAvailableBalance` from exchange. Each averaging checks if sufficient balance exists before placing order.
 6. **Emergency close on data issues**: Bot stops immediately if exchange data cannot be fetched (fail-fast principle).
 
 ## Quick Reference
