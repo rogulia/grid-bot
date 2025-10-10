@@ -296,18 +296,30 @@ class MetricsTracker:
 
         return summary
 
-    def save_summary_report(self):
-        """Save summary report to files"""
+    def save_summary_report(self, date_suffix: str = None):
+        """
+        Save summary report to files
+
+        Args:
+            date_suffix: Optional date suffix for filename (e.g., '2025-10-10').
+                        If None, uses default 'summary_report' name.
+        """
         summary = self.generate_summary_report()
 
+        # Build filename with optional date suffix
+        if date_suffix:
+            base_name = f"summary_report_{date_suffix}"
+        else:
+            base_name = "summary_report"
+
         # Save JSON (with prefix for backtesting)
-        json_filename = f"{self.file_prefix}summary_report.json"
+        json_filename = f"{self.file_prefix}{base_name}.json"
         json_file = self.data_dir / json_filename
         with open(json_file, 'w', encoding='utf-8') as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
 
         # Save human-readable text (with prefix for backtesting)
-        txt_filename = f"{self.file_prefix}summary_report.txt"
+        txt_filename = f"{self.file_prefix}{base_name}.txt"
         txt_file = self.data_dir / txt_filename
         with open(txt_file, 'w', encoding='utf-8') as f:
             f.write("═" * 60 + "\n")

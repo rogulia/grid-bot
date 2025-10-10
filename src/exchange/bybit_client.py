@@ -493,6 +493,63 @@ class BybitClient:
             self.logger.error(f"Error getting closed PnL: {e}")
             return []
 
+    def get_order_history(
+        self,
+        symbol: str,
+        category: str = "linear",
+        limit: int = 50
+    ) -> List[Dict]:
+        """
+        Get order history (executed/cancelled orders)
+
+        This is used to reconstruct position history after bot restart.
+
+        Args:
+            symbol: Trading symbol (e.g., 'SOLUSDT')
+            category: Market category (default: 'linear')
+            limit: Number of records to retrieve (default: 50, max: 50)
+
+        Returns:
+            List of order records, each containing:
+                - orderId: Order ID
+                - symbol: Trading symbol
+                - side: 'Buy' or 'Sell'
+                - orderType: 'Market' or 'Limit'
+                - price: Order price
+                - qty: Order quantity
+                - cumExecQty: Executed quantity
+                - avgPrice: Average execution price
+                - reduceOnly: True if reduce-only order
+                - positionIdx: Position index (1=LONG, 2=SHORT in hedge mode)
+                - orderStatus: Order status ('Filled', 'Cancelled', etc.)
+                - createdTime: Creation timestamp (ms)
+                - updatedTime: Update timestamp (ms)
+
+        Example:
+            >>> # Get recent order history for SOLUSDT
+            >>> orders = client.get_order_history('SOLUSDT', limit=50)
+            >>> for order in orders:
+            ...     print(f"{order['side']} {order['qty']} @ {order['avgPrice']}")
+        """
+        try:
+            response = self.session.get_order_history(
+                category=category,
+                symbol=symbol,
+                limit=limit
+            )
+
+            if response.get('retCode') == 0:
+                orders = response.get('result', {}).get('list', [])
+                self.logger.debug(f"Retrieved {len(orders)} order history records for {symbol}")
+                return orders
+            else:
+                self.logger.error(f"Failed to get order history: {response}")
+                return []
+
+        except Exception as e:
+            self.logger.error(f"Error getting order history: {e}")
+            return []
+
     def get_transaction_log(
         self,
         symbol: str = None,

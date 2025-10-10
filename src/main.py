@@ -4,6 +4,7 @@ import asyncio
 import signal
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 # Add parent directory to path for imports
@@ -36,6 +37,9 @@ class TradingBot:
         self.position_managers: dict[str, PositionManager] = {}  # {symbol: PositionManager}
         self.websockets: dict[str, BybitWebSocket] = {}  # {symbol: WebSocket}
         self.last_log_times: dict[str, float] = {}  # {symbol: last_log_timestamp}
+
+        # Daily summary report tracking
+        self.last_summary_report_date: str = None  # Track last report date (YYYY-MM-DD)
 
         self.running = False
 
@@ -184,6 +188,14 @@ class TradingBot:
                 self.logger.error(f"No strategy/position_manager for {symbol}")
                 return
 
+            # Check if strategy is in emergency stop state
+            if strategy.is_stopped():
+                self.logger.error(
+                    f"[{symbol}] Strategy in emergency stop state - stopping bot!"
+                )
+                self.running = False
+                return
+
             # Execute strategy
             strategy.on_price_update(price)
 
@@ -239,6 +251,21 @@ class TradingBot:
                         long_pnl=long_pnl,
                         short_pnl=short_pnl
                     )
+
+                # Generate daily summary report (once per day)
+                current_date = datetime.now().strftime('%Y-%m-%d')
+                if self.last_summary_report_date != current_date:
+                    if self.metrics_tracker:
+                        self.logger.info(f"📊 Generating daily summary report for {current_date}...")
+                        try:
+                            # Generate report for previous day (or current if first run)
+                            summary = self.metrics_tracker.save_summary_report(date_suffix=current_date)
+                            self.logger.info(
+                                f"💾 Daily report saved: summary_report_{current_date}.json/.txt"
+                            )
+                            self.last_summary_report_date = current_date
+                        except Exception as e:
+                            self.logger.error(f"Failed to generate daily summary report: {e}")
 
                 self.last_log_times[symbol] = current_time
 
@@ -314,13 +341,8 @@ class TradingBot:
                             short_pnl=short_pnl
                         )
 
-        # Generate and save summary report
-        if self.metrics_tracker:
-            self.logger.info("Generating performance summary report...")
-            summary = self.metrics_tracker.save_summary_report()
-            self.logger.info(f"📊 Total PnL: ${summary['performance']['total_pnl']:.2f} ({summary['performance']['roi_percent']:+.2f}%)")
-            self.logger.info(f"📈 Win Rate: {summary['performance']['win_rate']:.1f}%")
-            self.logger.info("💾 Reports saved to data/summary_report.json and .txt")
+        # Summary reports are now generated daily (see on_price_update handler)
+        # No need to generate on shutdown - prevents report spam on frequent restarts
 
         self.logger.info("✅ Bot stopped gracefully")
 

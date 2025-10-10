@@ -68,6 +68,9 @@ class GridStrategy:
         }
         self._warning_interval = 60  # Log warnings max once per 60 seconds
 
+        # Emergency stop flag - prevents any operations after critical failure
+        self.emergency_stopped = False
+
         self.logger.info(
             f"[{self.symbol}] Grid strategy initialized - Symbol: {self.symbol}, "
             f"Leverage: {self.leverage}x, Grid: {self.grid_step_pct}%, "
@@ -184,6 +187,148 @@ class GridStrategy:
         """
         return qty * price
 
+    def is_stopped(self) -> bool:
+        """
+        Check if strategy is in emergency stop state
+
+        Returns:
+            True if emergency stop was triggered, False otherwise
+        """
+        return self.emergency_stopped
+
+    def _restore_positions_from_order_history(self, side: str, exchange_qty: float, exchange_avg_price: float) -> bool:
+        """
+        Restore position history from exchange order history (PRIMARY method)
+
+        This method reconstructs the position grid levels by analyzing order history:
+        1. Gets recent order history from exchange
+        2. Finds last reduceOnly order (position closure)
+        3. All orders after that = current position orders
+        4. Restores each order as separate position with grid_level
+
+        Args:
+            side: 'Buy' or 'Sell'
+            exchange_qty: Current position quantity from exchange
+            exchange_avg_price: Average entry price from exchange
+
+        Returns:
+            True if successfully restored, False otherwise
+
+        Raises:
+            RuntimeError: If restoration fails (fail-fast principle)
+        """
+        try:
+            # Get order history from exchange
+            order_history = self.client.get_order_history(
+                symbol=self.symbol,
+                category=self.category,
+                limit=50
+            )
+
+            if not order_history:
+                raise RuntimeError(
+                    f"[{self.symbol}] Cannot restore {side} position: order history is empty. "
+                    f"Exchange shows {exchange_qty} position but no order history available."
+                )
+
+            # Filter by position index (1=LONG/Buy, 2=SHORT/Sell)
+            position_idx = 1 if side == 'Buy' else 2
+            relevant_orders = [
+                order for order in order_history
+                if int(order.get('positionIdx', 0)) == position_idx
+                and order.get('orderStatus') == 'Filled'  # Only filled orders
+            ]
+
+            if not relevant_orders:
+                raise RuntimeError(
+                    f"[{self.symbol}] Cannot restore {side} position: no filled orders found "
+                    f"with positionIdx={position_idx}. Exchange shows {exchange_qty} position."
+                )
+
+            # Sort by creation time (oldest first)
+            relevant_orders.sort(key=lambda x: int(x.get('createdTime', 0)))
+
+            # Find last reduceOnly order (position closure)
+            last_reduce_idx = -1
+            for i, order in enumerate(relevant_orders):
+                if order.get('reduceOnly', False):
+                    last_reduce_idx = i
+
+            # Orders after last closure = current position
+            if last_reduce_idx >= 0:
+                # Position was closed and reopened
+                position_orders = relevant_orders[last_reduce_idx + 1:]
+            else:
+                # No closure found - all orders are part of current position
+                position_orders = relevant_orders
+
+            # Filter out reduceOnly orders (we only want position-opening orders)
+            position_orders = [
+                order for order in position_orders
+                if not order.get('reduceOnly', False)
+            ]
+
+            if not position_orders:
+                raise RuntimeError(
+                    f"[{self.symbol}] Cannot restore {side} position: no position-opening orders found "
+                    f"after last closure. Exchange shows {exchange_qty} position."
+                )
+
+            # Restore each order as separate position
+            total_qty = 0.0
+            for grid_level, order in enumerate(position_orders):
+                qty = float(order.get('cumExecQty', 0))  # Executed quantity
+                price = float(order.get('avgPrice', 0))   # Average execution price
+
+                if qty == 0 or price == 0:
+                    self.logger.warning(
+                        f"[{self.symbol}] Skipping order {order.get('orderId')} with qty={qty}, price={price}"
+                    )
+                    continue
+
+                self.pm.add_position(
+                    side=side,
+                    entry_price=price,
+                    quantity=qty,
+                    grid_level=grid_level
+                )
+                total_qty += qty
+
+                self.logger.info(
+                    f"📥 [{self.symbol}] Restored {side} Grid {grid_level}: "
+                    f"{qty} @ ${price:.4f} (order: {order.get('orderId')})"
+                )
+
+            # Validate total quantity matches exchange
+            qty_diff = abs(total_qty - exchange_qty)
+            tolerance = 0.01  # Allow 0.01 difference for rounding
+
+            if qty_diff > tolerance:
+                # Quantity mismatch - this is critical error
+                raise RuntimeError(
+                    f"[{self.symbol}] Position restoration FAILED: quantity mismatch!\n"
+                    f"  Exchange qty: {exchange_qty}\n"
+                    f"  Restored qty: {total_qty}\n"
+                    f"  Difference: {qty_diff}\n"
+                    f"  Orders restored: {len(position_orders)}\n"
+                    f"This indicates data corruption or API inconsistency."
+                )
+
+            self.logger.info(
+                f"✅ [{self.symbol}] Successfully restored {side} position from order history: "
+                f"{len(position_orders)} orders, total {total_qty} @ avg ${exchange_avg_price:.4f}"
+            )
+            return True
+
+        except RuntimeError:
+            # Re-raise RuntimeError as-is (fail-fast)
+            raise
+        except Exception as e:
+            # Unexpected error - also fail fast
+            raise RuntimeError(
+                f"[{self.symbol}] Unexpected error restoring {side} position from order history: {e}"
+            ) from e
+
     def sync_with_exchange(self, current_price: float):
         """
         Sync local position state with exchange reality
@@ -194,6 +339,14 @@ class GridStrategy:
         Args:
             current_price: Current market price
         """
+        # Block all operations if emergency stop was triggered
+        if self.emergency_stopped:
+            self.logger.warning(
+                f"⚠️  [{self.symbol}] Sync blocked: bot in emergency stop state. "
+                f"Fix issues and restart bot manually."
+            )
+            return
+
         self.logger.debug(f"🔄 [{self.symbol}] Syncing positions with exchange...")
 
         for side in ['Buy', 'Sell']:
@@ -208,17 +361,19 @@ class GridStrategy:
                 exchange_avg_price = float(exchange_pos.get('avgPrice', current_price))
 
                 if local_qty == 0:
-                    # Exchange has position but we don't track it -> restore tracking
+                    # Exchange has position but we don't track it -> restore from order history
                     self.logger.info(
-                        f"📥 [{self.symbol}] Restoring {side} position from exchange: "
+                        f"📥 [{self.symbol}] Restoring {side} position from order history: "
                         f"{exchange_qty} @ ${exchange_avg_price:.4f}"
                     )
-                    self.pm.add_position(
+
+                    # Restore positions from exchange order history (PRIMARY method - fail-fast!)
+                    self._restore_positions_from_order_history(
                         side=side,
-                        entry_price=exchange_avg_price,
-                        quantity=exchange_qty,
-                        grid_level=0  # We don't know exact grid level, assume 0
+                        exchange_qty=exchange_qty,
+                        exchange_avg_price=exchange_avg_price
                     )
+
                     # Set TP order
                     self._update_tp_order(side)
                 else:
@@ -494,6 +649,10 @@ class GridStrategy:
         Args:
             current_price: Current market price
         """
+        # Block all operations if emergency stop was triggered
+        if self.emergency_stopped:
+            return
+
         try:
             # Check risk limits first
             if not self._check_risk_limits(current_price):
@@ -505,7 +664,12 @@ class GridStrategy:
             # Check for take profit
             self._check_take_profit(current_price)
 
+        except RuntimeError as e:
+            # RuntimeError indicates critical failure - re-raise to stop bot
+            self.logger.error(f"[{self.symbol}] Critical error in strategy execution: {e}", exc_info=True)
+            raise
         except Exception as e:
+            # Other exceptions are logged but don't stop the bot
             self.logger.error(f"[{self.symbol}] Error in strategy execution: {e}", exc_info=True)
 
     def _check_grid_entries(self, current_price: float):
@@ -548,9 +712,8 @@ class GridStrategy:
 
         # Check if we hit the grid step
         if price_change_pct >= self.grid_step_pct:
-            self.logger.info(
-                f"[{self.symbol}] {side} grid level hit: {price_change_pct:.2f}% from last entry"
-            )
+            # Don't log here - will log in _execute_grid_order() if order actually places
+            # This prevents log spam when conditions are met but order doesn't execute (e.g., insufficient balance)
             return True
 
         return False
@@ -923,6 +1086,9 @@ class GridStrategy:
                             side, current_price,
                             f"Account MM Rate {account_mm_rate:.2f}% >= 90%"
                         )
+
+                # Set emergency stop flag to prevent further operations
+                self.emergency_stopped = True
 
                 # STOP BOT - this is critical!
                 raise RuntimeError(
