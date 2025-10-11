@@ -196,6 +196,40 @@ class GridStrategy:
         """
         return self.emergency_stopped
 
+    def _create_emergency_stop_flag(self, reason: str):
+        """
+        Create emergency stop flag file to prevent bot restart
+
+        This file signals systemd/supervisor not to restart the bot
+        after emergency shutdown. User must manually remove file and
+        fix issues before restarting.
+
+        Args:
+            reason: Reason for emergency stop
+        """
+        from datetime import datetime
+        from pathlib import Path
+
+        flag_file = Path("data/.emergency_stop")
+        flag_file.parent.mkdir(parents=True, exist_ok=True)
+
+        flag_content = {
+            "timestamp": datetime.now().isoformat(),
+            "symbol": self.symbol,
+            "reason": reason
+        }
+
+        import json
+        with open(flag_file, 'w') as f:
+            json.dump(flag_content, f, indent=2)
+
+        self.logger.critical(
+            f"🚨 [{self.symbol}] EMERGENCY STOP FLAG CREATED: {flag_file}\n"
+            f"   Reason: {reason}\n"
+            f"   Bot will not restart automatically.\n"
+            f"   Fix issues and remove this file before restarting."
+        )
+
     def _restore_positions_from_order_history(self, side: str, exchange_qty: float, exchange_avg_price: float) -> bool:
         """
         Restore position history from exchange order history (PRIMARY method)
@@ -349,6 +383,18 @@ class GridStrategy:
 
         self.logger.debug(f"🔄 [{self.symbol}] Syncing positions with exchange...")
 
+        # Get available balance for initial position check
+        available_balance = 0.0
+        if not self.dry_run:
+            try:
+                balance_info = self.client.get_wallet_balance(account_type="UNIFIED")
+                for account in balance_info.get('list', []):
+                    if account.get('accountType') == 'UNIFIED':
+                        available_balance = float(account.get('totalAvailableBalance', 0))
+                        break
+            except Exception as e:
+                self.logger.error(f"[{self.symbol}] Failed to get balance: {e}")
+
         for side in ['Buy', 'Sell']:
             # Check if we have local position tracked
             local_qty = self.pm.get_total_quantity(side)
@@ -492,6 +538,22 @@ class GridStrategy:
                     # NOW remove local tracking
                     self.pm.remove_all_positions(side)
                     self.pm.set_tp_order_id(side, None)
+
+                # Check balance before opening initial position
+                if not self.dry_run and available_balance < self.initial_size_usd:
+                    reason = (
+                        f"Insufficient balance to start trading: "
+                        f"need ${self.initial_size_usd:.2f} MARGIN for initial position, "
+                        f"available ${available_balance:.2f}"
+                    )
+                    self.logger.error(f"❌ [{self.symbol}] {reason}")
+
+                    # Create emergency stop flag
+                    self._create_emergency_stop_flag(reason)
+                    self.emergency_stopped = True
+
+                    # Stop bot - raise RuntimeError to prevent further operations
+                    raise RuntimeError(f"[{self.symbol}] {reason}")
 
                 # Open initial position
                 initial_qty = self._usd_to_qty(self.initial_size_usd, current_price)
@@ -1090,12 +1152,16 @@ class GridStrategy:
                 # Set emergency stop flag to prevent further operations
                 self.emergency_stopped = True
 
-                # STOP BOT - this is critical!
-                raise RuntimeError(
-                    f"[{self.symbol}] Bot stopped: Account Maintenance Margin Rate "
-                    f"{account_mm_rate:.2f}% reached critical level (>= 90%). "
-                    f"All positions closed. Review account and fix issues before restarting."
+                # Create emergency stop flag file to prevent systemd restart
+                reason = (
+                    f"Account Maintenance Margin Rate {account_mm_rate:.2f}% "
+                    f"reached critical level (>= 90%). All positions closed. "
+                    f"Review account and fix issues before restarting."
                 )
+                self._create_emergency_stop_flag(reason)
+
+                # STOP BOT - this is critical!
+                raise RuntimeError(f"[{self.symbol}] {reason}")
 
         # Balance check is now performed in _execute_grid_order() using totalAvailableBalance from exchange
         # This is simpler and more accurate than calculating exposure manually

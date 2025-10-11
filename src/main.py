@@ -1,6 +1,7 @@
 """Main entry point for SOL-Trader bot"""
 
 import asyncio
+import json
 import signal
 import sys
 import time
@@ -40,6 +41,7 @@ class TradingBot:
 
         # Daily summary report tracking
         self.last_summary_report_date: str = None  # Track last report date (YYYY-MM-DD)
+        self.bot_start_time: float = time.time()  # Track bot start time
 
         self.running = False
 
@@ -49,6 +51,32 @@ class TradingBot:
             self.logger.info("=" * 60)
             self.logger.info("🤖 SOL-Trader Bot Starting (Multi-Symbol)...")
             self.logger.info("=" * 60)
+
+            # Check for emergency stop flag (prevents restart after critical failures)
+            emergency_flag = Path("data/.emergency_stop")
+            if emergency_flag.exists():
+                try:
+                    with open(emergency_flag, 'r') as f:
+                        flag_data = json.load(f)
+
+                    self.logger.critical("=" * 60)
+                    self.logger.critical("🚨 EMERGENCY STOP FLAG DETECTED")
+                    self.logger.critical("=" * 60)
+                    self.logger.critical(f"Timestamp: {flag_data.get('timestamp', 'unknown')}")
+                    self.logger.critical(f"Symbol: {flag_data.get('symbol', 'unknown')}")
+                    self.logger.critical(f"Reason: {flag_data.get('reason', 'unknown')}")
+                    self.logger.critical("=" * 60)
+                    self.logger.critical("Bot will NOT start. Please:")
+                    self.logger.critical("1. Review the issue and fix it")
+                    self.logger.critical("2. Ensure sufficient balance")
+                    self.logger.critical("3. Remove the flag file: rm data/.emergency_stop")
+                    self.logger.critical("4. Restart the bot")
+                    self.logger.critical("=" * 60)
+                except Exception as e:
+                    self.logger.critical(f"Emergency flag exists but couldn't read it: {e}")
+
+                # Exit with code 0 (success) so systemd doesn't restart with Restart=on-failure
+                sys.exit(0)
 
             # Get API credentials
             api_key, api_secret = self.config.get_api_credentials()
@@ -252,16 +280,23 @@ class TradingBot:
                         short_pnl=short_pnl
                     )
 
-                # Generate daily summary report (once per day)
+                # Generate daily summary report (once per day, but not on first run)
                 current_date = datetime.now().strftime('%Y-%m-%d')
+
+                # Initialize last_summary_report_date on first periodic check (prevents immediate report)
+                if self.last_summary_report_date is None:
+                    self.last_summary_report_date = current_date
+                    self.logger.debug(f"Initialized summary report tracking for {current_date}")
+
+                # Generate report only when date changes (new day)
                 if self.last_summary_report_date != current_date:
                     if self.metrics_tracker:
-                        self.logger.info(f"📊 Generating daily summary report for {current_date}...")
+                        self.logger.info(f"📊 Generating daily summary report for {self.last_summary_report_date}...")
                         try:
-                            # Generate report for previous day (or current if first run)
-                            summary = self.metrics_tracker.save_summary_report(date_suffix=current_date)
+                            # Generate report for PREVIOUS day
+                            summary = self.metrics_tracker.save_summary_report(date_suffix=self.last_summary_report_date)
                             self.logger.info(
-                                f"💾 Daily report saved: summary_report_{current_date}.json/.txt"
+                                f"💾 Daily report saved: summary_report_{self.last_summary_report_date}.json/.txt"
                             )
                             self.last_summary_report_date = current_date
                         except Exception as e:

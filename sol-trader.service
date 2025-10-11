@@ -13,9 +13,14 @@ Environment="PATH=/home/iuriirogulia/projects/sol-trader/.venv/bin:/usr/local/bi
 # Команда запуска
 ExecStart=/home/iuriirogulia/projects/sol-trader/.venv/bin/python /home/iuriirogulia/projects/sol-trader/src/main.py
 
-# Автоматический перезапуск при падении
-Restart=always
+# Автоматический перезапуск только при крашах (exit code != 0)
+# При emergency stop (exit code 0) бот НЕ перезапустится
+Restart=on-failure
 RestartSec=10
+
+# Ограничение частоты перезапусков (защита от rapid restart loop)
+StartLimitBurst=5
+StartLimitIntervalSec=60
 
 # Логирование
 StandardOutput=journal

@@ -12,19 +12,29 @@ exchange:
 # Каждая монета работает независимо со своими параметрами
 strategies:
   # Стратегия #1: SOLUSDT
-  - symbol: "SOLUSDT"              # Торговая пара
-    category: "linear"             # USDT Perpetual
-    leverage: 100                  # Плечо 100x (ВЫСОКИЙ РИСК!)
+  # - symbol: "SOLUSDT"
+  #   category: "linear"
+  #   leverage: 100
+  #   initial_position_size_usd: 1.0 # МАРЖА в USD (плечо применяется автоматически!)
+  #   grid_step_percent: 1.0         # Шаг усреднения в %
+  #   averaging_multiplier: 2.0      # Мультипликатор размера позиции
+  #   take_profit_percent: 1.0       # Фиксация прибыли при отскоке на %
+  #   max_grid_levels_per_side: 10   # Максимум grid уровней
+
+  # Стратегия #2: DOGEUSDT
+  - symbol: "DOGEUSDT"
+    category: "linear"
+    leverage: 75
     initial_position_size_usd: 1.0 # МАРЖА в USD (плечо применяется автоматически!)
     grid_step_percent: 1.0         # Шаг усреднения в %
     averaging_multiplier: 2.0      # Мультипликатор размера позиции
     take_profit_percent: 1.0       # Фиксация прибыли при отскоке на %
     max_grid_levels_per_side: 10   # Максимум grid уровней
 
-  # Стратегия #2: DOGEUSDT
-  - symbol: "DOGEUSDT"
+  # Стратегия #3: TONUSDT
+  - symbol: "TONUSDT"
     category: "linear"
-    leverage: 75                   # Более безопасное плечо для DOGE
+    leverage: 50
     initial_position_size_usd: 1.0 # МАРЖА в USD (плечо применяется автоматически!)
     grid_step_percent: 1.0         # Шаг усреднения в %
     averaging_multiplier: 2.0      # Мультипликатор размера позиции
