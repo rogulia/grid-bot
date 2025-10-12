@@ -67,8 +67,8 @@ def setup_logger(name: str = "sol-trader", log_level: str = "INFO", log_prefix: 
     )
     file_handler.setFormatter(file_formatter)
 
-    # Error handler - separate file for errors (with prefix)
-    error_filename = f"{log_prefix}errors.log"
+    # Error handler - separate file for errors (with prefix and date)
+    error_filename = f"{log_prefix}errors_{today}.log"
     error_handler = logging.FileHandler(
         logs_dir / error_filename,
         encoding='utf-8'
@@ -84,21 +84,44 @@ def setup_logger(name: str = "sol-trader", log_level: str = "INFO", log_prefix: 
 
 
 def log_trade(logger: logging.Logger, side: str, price: float, qty: float,
-              reason: str, dry_run: bool = True):
-    """Log a trade execution"""
+              reason: str, dry_run: bool = True, account_prefix: str = ""):
+    """
+    Log a trade execution
+
+    Args:
+        logger: Logger instance
+        side: Buy or Sell
+        price: Execution price
+        qty: Quantity
+        reason: Trade reason
+        dry_run: If True, marks as DRY RUN
+        account_prefix: Account ID prefix (e.g., "001_")
+    """
     mode = "[DRY RUN]" if dry_run else "[LIVE]"
     logger.info(f"{mode} TRADE: {side} {qty} @ ${price:.4f} - Reason: {reason}")
 
-    # Also write to dedicated trades log (Helsinki timezone)
+    # Also write to dedicated trades log (Helsinki timezone, with account prefix)
     today = format_helsinki(fmt="%Y-%m-%d")
-    with open(f"logs/trades_{today}.log", "a", encoding='utf-8') as f:
+    log_file = f"logs/{account_prefix}trades_{today}.log"
+    with open(log_file, "a", encoding='utf-8') as f:
         timestamp = format_helsinki()
         f.write(f"{timestamp} | {mode} | {side} | {qty} | ${price:.4f} | {reason}\n")
 
 
 def log_position_state(logger: logging.Logger, long_positions: list, short_positions: list,
-                       long_pnl: float, short_pnl: float, current_price: float):
-    """Log current position state"""
+                       long_pnl: float, short_pnl: float, current_price: float, account_prefix: str = ""):
+    """
+    Log current position state
+
+    Args:
+        logger: Logger instance
+        long_positions: List of long positions
+        short_positions: List of short positions
+        long_pnl: Long side PnL
+        short_pnl: Short side PnL
+        current_price: Current market price
+        account_prefix: Account ID prefix (e.g., "001_")
+    """
     logger.info(
         f"Position State - Price: ${current_price:.4f} | "
         f"LONG: {len(long_positions)} positions (PnL: ${long_pnl:.2f}) | "
@@ -106,9 +129,10 @@ def log_position_state(logger: logging.Logger, long_positions: list, short_posit
         f"Total PnL: ${long_pnl + short_pnl:.2f}"
     )
 
-    # Write to dedicated position log (Helsinki timezone)
+    # Write to dedicated position log (Helsinki timezone, with account prefix)
     today = format_helsinki(fmt="%Y-%m-%d")
-    with open(f"logs/positions_{today}.log", "a", encoding='utf-8') as f:
+    log_file = f"logs/{account_prefix}positions_{today}.log"
+    with open(log_file, "a", encoding='utf-8') as f:
         timestamp = format_helsinki()
         f.write(
             f"{timestamp} | Price: ${current_price:.4f} | "

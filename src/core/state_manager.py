@@ -11,15 +11,22 @@ from src.utils.timezone import now_helsinki
 class StateManager:
     """Manage bot state persistence (supports multiple trading symbols)"""
 
-    def __init__(self, state_file: str = "data/bot_state.json", symbol: Optional[str] = None):
+    def __init__(self, state_file: str = "data/bot_state.json", symbol: Optional[str] = None, account_id: int = 0):
         """
         Initialize state manager
 
         Args:
-            state_file: Path to state JSON file
+            state_file: Path to state JSON file (e.g., data/001_bot_state.json for multi-account)
             symbol: Trading symbol (e.g., SOLUSDT). If None, manages all symbols.
+            account_id: Account ID (for multi-account logging)
         """
-        self.logger = logging.getLogger("sol-trader.state")
+        self.account_id = account_id
+        self.id_str = f"{account_id:03d}" if account_id > 0 else "000"
+
+        # Logger with account ID for better tracking
+        logger_name = f"sol-trader.state.{self.id_str}" if account_id > 0 else "sol-trader.state"
+        self.logger = logging.getLogger(logger_name)
+
         self.state_file = Path(state_file)
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.symbol = symbol

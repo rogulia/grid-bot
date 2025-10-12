@@ -4,29 +4,32 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-SOL-Trader is an automated Bybit futures trading bot implementing a dual-sided grid strategy (simultaneous LONG + SHORT positions) for SOLUSDT perpetual futures. The bot uses position averaging with a multiplier on each grid level and takes profit when prices reverse by a configured percentage.
+SOL-Trader is a **multi-account** automated Bybit futures trading bot implementing a dual-sided grid strategy (simultaneous LONG + SHORT positions) for perpetual futures. The bot supports multiple isolated accounts (for SaaS model), each with independent API credentials, strategies, risk limits, and data files. Each account uses position averaging with a multiplier on each grid level and takes profit when prices reverse by a configured percentage.
 
 **Language:** Python 3.9+
 **Exchange:** Bybit (Demo and Production)
 **Package Manager:** UV (Universal Virtualenv)
+**Architecture:** Multi-account SaaS-ready with complete data isolation
 
 ## Core Architecture
 
-### Three-Layer Design
+### Multi-Account Layer Design
 
-1. **Exchange Layer** (`src/exchange/`)
+1. **Account Orchestration Layer** (`src/core/`)
+   - `multi_account_bot.py`: Orchestrates multiple isolated accounts, manages WebSocket sharing by (symbol, environment)
+   - `trading_account.py`: Represents one isolated user account with own credentials, strategies, risk limits, and data files
+   - `state_manager.py`: Persists account state to JSON (e.g., `data/001_bot_state.json`) per account
+
+2. **Exchange Layer** (`src/exchange/`)
    - `bybit_client.py`: HTTP API wrapper using pybit for order execution, position management, leverage setting, and balance queries
-   - `bybit_websocket.py`: WebSocket client for real-time price updates with auto-reconnect
+   - `bybit_websocket.py`: WebSocket client for real-time price updates with auto-reconnect (shared across accounts for same symbol+environment)
 
-2. **Strategy Layer** (`src/strategy/`)
-   - `position_manager.py`: Tracks separate LONG and SHORT position lists, calculates weighted average entry prices, unrealized PnL, and liquidation distances
-   - `grid_strategy.py`: Core trading logic - determines when to add positions (averaging), when to take profit, and enforces risk limits
+3. **Strategy Layer** (`src/strategy/`)
+   - `position_manager.py`: Tracks separate LONG and SHORT position lists, calculates weighted average entry prices, unrealized PnL
+   - `grid_strategy.py`: Core trading logic - determines when to add positions (averaging), when to take profit, and enforces risk limits (including configurable MM Rate threshold)
 
-3. **Analytics Layer** (`src/analytics/`)
-   - `metrics_tracker.py`: Real-time performance tracking, CSV logging (trades and snapshots), and summary report generation
-
-4. **State Management** (`src/core/`)
-   - `state_manager.py`: Persists bot state to JSON (`data/bot_state.json`) including all positions and TP order IDs for state recovery after restarts
+4. **Analytics Layer** (`src/analytics/`)
+   - `metrics_tracker.py`: Per-account performance tracking, CSV logging with account ID prefix (e.g., `001_trades_history.csv`)
 
 ### Strategy Logic Flow
 
@@ -76,32 +79,36 @@ Every log message includes `[{self.symbol}]` prefix for multi-symbol trading cla
 - **Averaging**: New positions added at grid levels when price moves grid_step_percent against side
 - **Sizing**: Each new position is sized using `current_total_qty * (multiplier - 1)`
 - **Exit**: All positions on a side close together when weighted average entry price shows take_profit_percent gain
-- **Emergency Close**: Positions close if Account MM Rate >= 90%
+- **Emergency Close**: Positions close if Account MM Rate >= threshold (configurable per account, default 90%)
 - **Balance Check**: Before each averaging, bot checks `totalAvailableBalance` from exchange to ensure sufficient margin
 
 ### Critical Risk Management
 
-**High leverage warning (100x default):** At 100x leverage, liquidation occurs at ~1% price movement. The bot tracks liquidation distance separately for LONG and SHORT sides in `position_manager.get_liquidation_distance()`. Emergency close triggers when distance <= liquidation_buffer (default 0.5%).
+**High leverage warning (75-100x typical):** At high leverage, liquidation occurs from small price movements. The bot uses **Account Maintenance Margin Rate from Bybit** (not calculated locally) to monitor liquidation risk. Emergency close triggers when `Account MM Rate >= mm_rate_threshold` (configurable per account, default 90%). This accounts for entire account balance in Cross Margin mode and is the most accurate liquidation indicator.
 
-### Multi-Symbol Architecture
+### Multi-Account Architecture
 
-The bot supports trading multiple symbols simultaneously in a single instance:
+The bot supports multiple isolated accounts (for SaaS model), each representing a different user/client:
 
-**Shared Components (1 per bot):**
-- `BybitClient`: Single API client for all symbols
-- `MetricsTracker`: Aggregated analytics across all symbols
+**Per-Account Isolation (complete data separation):**
+- **API Credentials**: Each account has own `{ID}_BYBIT_API_KEY` and `{ID}_BYBIT_API_SECRET` in `.env`
+- **BybitClient**: Independent API client with unique credentials per account
+- **Strategies**: Per-account strategies configuration (can trade different symbols)
+- **Risk Limits**: Per-account `mm_rate_threshold` (e.g., account 1 = 90%, account 2 = 50%)
+- **Data Files**: All files prefixed with account ID (e.g., `001_bot_state.json`, `001_trades_history.csv`)
+- **Log Files**: 3 separate log files per account (`{ID}_bot_{date}.log`, `{ID}_trades_{date}.log`, `{ID}_positions_{date}.log`)
+- **Emergency Stop**: Per-account flag (`.{ID}_emergency_stop`)
 
-**Per-Symbol Components:**
-- `GridStrategy`: Independent strategy instance
-- `PositionManager`: Separate position tracking
-- `BybitWebSocket`: Dedicated WebSocket connection
-- State in `bot_state.json`: Keyed by symbol name
+**Shared Components (efficiency):**
+- **WebSocket Sharing**: One WebSocket per unique (symbol, environment) pair, broadcast to all accounts trading that pair
+- **Main Orchestrator**: `MultiAccountBot` coordinates all accounts and manages WebSocket sharing
 
 **Key Design Points:**
-- Each symbol operates independently - one symbol's failure doesn't affect others
-- All log messages prefixed with `[SYMBOL]` for filtering
-- CSV data includes `symbol` column for multi-symbol analysis
-- State file uses dict structure: `{"DOGEUSDT": {...}, "SOLUSDT": {...}}`
+- Complete isolation: one account's failure doesn't affect others
+- Zero-padded IDs (001, 002, ..., 999) for file sorting
+- File naming: `{ID}_filename` (ID as prefix, not suffix)
+- Each account can be in different environment (demo/production)
+- SaaS-ready: easy to add/remove accounts via config
 
 ## Development Commands
 
@@ -174,49 +181,92 @@ python src/main.py
 
 All configuration in `config/config.yaml`:
 
-**Multi-symbol trading:**
-Bot supports trading multiple symbols simultaneously. Each symbol has independent strategy configuration.
+**Multi-account structure:**
+Bot supports multiple isolated accounts. Each account represents one user/client with full isolation.
+
+```yaml
+accounts:
+  - id: 1                                  # Unique ID (1-999)
+    name: "Account Name"                    # Display name
+    api_key_env: "1_BYBIT_API_KEY"         # Env variable for API key
+    api_secret_env: "1_BYBIT_API_SECRET"   # Env variable for API secret
+    demo_trading: true                      # Demo (true) or Production (false)
+    dry_run: false                          # Dry run (true) or Live (false)
+
+    risk_management:                        # Per-account risk limits
+      mm_rate_threshold: 90.0              # Emergency close when Account MM Rate >= this %
+
+    strategies:                             # Per-account strategies
+      - symbol: "DOGEUSDT"                 # Trading pair
+        category: "linear"                  # Contract type
+        leverage: 75                        # Trading leverage (HIGH RISK)
+        initial_position_size_usd: 1.0     # Starting margin in USD
+        grid_step_percent: 1.0             # Price movement % to trigger averaging
+        averaging_multiplier: 2.0          # Martingale multiplier (1→2→4→8)
+        take_profit_percent: 1.0           # Profit % to close positions
+        max_grid_levels_per_side: 10       # Maximum averaging levels
+```
 
 **Strategy parameters (per symbol):**
-- `symbol`: Trading pair (REQUIRED - no default!)
-- `category`: Contract type (linear for USDT perpetuals)
+- `symbol`: Trading pair (REQUIRED!)
 - `leverage`: Trading leverage (75-100x typical - HIGH RISK)
-- `initial_position_size_usd`: Starting margin in USD (NOT position size - leverage applied automatically!)
+- `initial_position_size_usd`: Starting margin in USD (leverage applied automatically!)
 - `grid_step_percent`: Price movement % to trigger averaging
 - `averaging_multiplier`: Classic martingale multiplier (2.0 = 1→2→4→8→16)
 - `take_profit_percent`: Profit % to close positions
 - `max_grid_levels_per_side`: Maximum averaging levels
 
-**Risk parameters (global for all symbols):**
-- `max_total_exposure`: **DEPRECATED** - No longer used. Balance checks use `totalAvailableBalance` from exchange directly before each order
-- `liquidation_buffer`: **DEPRECATED** - Liquidation risk now managed via Account MM Rate (emergency close at 90%)
-- `emergency_stop_loss`: Total PnL loss trigger (not currently implemented)
+**Risk parameters (per account):**
+- `mm_rate_threshold`: Emergency close when Account MM Rate >= this % (default: 90)
 
-**Bot modes:**
-- `bot.dry_run`: true = simulation (no API calls), false = real execution
-- `exchange.demo_trading`: true = demo server, false = production
+**DEPRECATED parameters (no longer used):**
+- `max_total_exposure` → Uses `totalAvailableBalance` from exchange
+- `liquidation_buffer` → Uses Account MM Rate from exchange
+- `emergency_stop_loss` → Not implemented (MM Rate protection is better)
+
+**Account modes (per account):**
+- `demo_trading`: true = demo environment, false = production
+- `dry_run`: true = simulation (no API calls), false = real execution
 
 ### API Credentials
 
-Stored in `.env` (not committed):
+Stored in `.env` (not committed), with **ID prefix format**:
 ```bash
-BYBIT_API_KEY=your_key
-BYBIT_API_SECRET=your_secret
-BYBIT_ENV=demo  # or production
+# Account 1
+1_BYBIT_API_KEY=your_key_here
+1_BYBIT_API_SECRET=your_secret_here
+
+# Account 2
+2_BYBIT_API_KEY=your_key_here
+2_BYBIT_API_SECRET=your_secret_here
 ```
+
+**Important:** ID in `.env` must match `id` in `config.yaml` accounts section.
 
 Get demo API keys from https://testnet.bybit.com
 
 ## Data and Logs
 
-**Generated files:**
-- `logs/bot_YYYY-MM-DD.log`: Main bot events and state changes
-- `logs/trades_YYYY-MM-DD.log`: Every trade execution
-- `logs/positions_YYYY-MM-DD.log`: Position state snapshots
-- `data/performance_metrics.csv`: Time-series snapshots (every 60s)
-- `data/trades_history.csv`: All trades with PnL
-- `data/summary_report.json` / `.txt`: Final performance summary
-- `data/bot_state.json`: Persisted position state (for recovery after restarts)
+**Per-account generated files (ID prefix format):**
+
+Account 001 example:
+- `logs/001_bot_YYYY-MM-DD.log`: Main bot events and state changes
+- `logs/001_trades_YYYY-MM-DD.log`: Every trade execution
+- `logs/001_positions_YYYY-MM-DD.log`: Position state snapshots
+- `data/001_performance_metrics.csv`: Time-series snapshots (every 60s)
+- `data/001_trades_history.csv`: All trades with PnL
+- `data/001_bot_state.json`: Persisted position state (for recovery after restarts)
+
+**System logs:**
+- `logs/main_YYYY-MM-DD.log`: Orchestrator events (multi-account coordination)
+
+**Emergency stop files:**
+- `data/.001_emergency_stop`: Per-account emergency flag (prevents restart until removed)
+
+**File naming convention:**
+- **ID as prefix:** `{ID}_filename` (e.g., `001_bot_state.json`, NOT `bot_state_001.json`)
+- **Zero-padded IDs:** 001, 002, ..., 999 for proper file sorting
+- **Hidden emergency files:** `.{ID}_emergency_stop` (dot prefix)
 
 ## Important Patterns
 
@@ -286,13 +336,20 @@ Core libraries:
 ## Quick Reference
 
 **Start bot in demo mode (foreground):**
-1. Set API keys in `.env`
+1. Set API keys in `.env` with ID prefix format:
+   ```
+   1_BYBIT_API_KEY=xxx
+   1_BYBIT_API_SECRET=yyy
+   ```
 2. Ensure `config/config.yaml` has:
-   - `strategies:` section with at least one symbol (REQUIRED - no default!)
-   - `demo_trading: true`
-   - `dry_run: false`
+   - `accounts:` section with at least one account (REQUIRED!)
+   - Account `id: 1` matching .env credentials
+   - Account has `demo_trading: true` and `dry_run: false`
+   - Account has at least one strategy in `strategies:` array
 3. Run `python src/main.py`
-4. Monitor logs in `logs/` directory or systemd journal
+4. Monitor logs:
+   - Per-account: `tail -f logs/001_bot_YYYY-MM-DD.log`
+   - System: `tail -f logs/main_YYYY-MM-DD.log`
 5. Stop with Ctrl+C (graceful shutdown)
 
 **Start bot as background service:**
@@ -300,7 +357,7 @@ Core libraries:
 2. Start: `sudo systemctl start sol-trader`
 3. Check status: `sudo systemctl status sol-trader`
 4. View logs: `sudo journalctl -u sol-trader -f`
-5. Filter by symbol: `sudo journalctl -u sol-trader -f | grep DOGEUSDT`
+5. Filter by account: `sudo journalctl -u sol-trader -f | grep "\[001\]"`
 6. Stop: `sudo systemctl stop sol-trader`
 
 See `BACKGROUND_SERVICE_GUIDE.md` for detailed instructions on running the bot 24/7.
@@ -322,17 +379,29 @@ pytest tests/ -v  # All 113 tests
 
 ## Common Development Workflows
 
-### Adding a New Symbol to Trade
+### Adding a New Account
 
 1. Stop the bot: `sudo systemctl stop sol-trader`
-2. Edit `config/config.yaml` - add new strategy entry under `strategies:`
+2. Add credentials to `.env`:
+   ```
+   2_BYBIT_API_KEY=xxx
+   2_BYBIT_API_SECRET=yyy
+   ```
+3. Edit `config/config.yaml` - add new account entry under `accounts:`
+4. Start bot: `sudo systemctl start sol-trader`
+5. Verify in logs: `sudo journalctl -u sol-trader -f | grep "\[002\]"`
+
+### Adding a New Symbol to Account
+
+1. Stop the bot: `sudo systemctl stop sol-trader`
+2. Edit `config/config.yaml` - add strategy to account's `strategies:` array
 3. Ensure symbol is valid on Bybit (check https://testnet.bybit.com for demo)
 4. Start bot: `sudo systemctl start sol-trader`
-5. Verify in logs: `sudo journalctl -u sol-trader -f | grep "[NEWSYMBOL]"`
+5. Verify in logs: `sudo journalctl -u sol-trader -f | grep "\[001\]" | grep "NEWSYMBOL"`
 
 ### Debugging Position Issues
 
-1. Check current state: `cat data/bot_state.json | python3 -m json.tool`
+1. Check account state: `cat data/001_bot_state.json | python3 -m json.tool`
 2. View recent trades: `cat data/trades_history.csv | tail -20`
 3. Check liquidation warnings: `sudo journalctl -u sol-trader | grep "liquidation"`
 4. Verify positions on exchange manually at https://testnet.bybit.com (demo) or https://bybit.com (prod)

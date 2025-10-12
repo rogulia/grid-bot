@@ -135,9 +135,112 @@ class ConfigLoader:
         return api_key, api_secret
 
     def is_demo(self) -> bool:
-        """Check if running in demo mode"""
+        """Check if running in demo mode (DEPRECATED - use per-account demo_trading)"""
         return self.get('exchange.demo_trading', True)
 
     def is_dry_run(self) -> bool:
-        """Check if running in dry run mode (simulation)"""
+        """Check if running in dry run mode (DEPRECATED - use per-account dry_run)"""
         return self.get('bot.dry_run', True)
+
+    def get_accounts_config(self) -> list[Dict[str, Any]]:
+        """
+        Get all accounts configuration (multi-account support)
+
+        Returns:
+            List of account configs
+
+        Raises:
+            ValueError: If no accounts section found or invalid format
+        """
+        accounts = self.config.get('accounts')
+
+        if not accounts or not isinstance(accounts, list):
+            raise ValueError(
+                "No 'accounts' section in config.yaml!\n"
+                "Please migrate to multi-account format.\n"
+                "See config/.env.example for migration guide.\n"
+                "\n"
+                "Example:\n"
+                "accounts:\n"
+                "  - id: 1\n"
+                "    name: \"My Account\"\n"
+                "    api_key_env: \"1_BYBIT_API_KEY\"\n"
+                "    api_secret_env: \"1_BYBIT_API_SECRET\"\n"
+                "    demo_trading: true\n"
+                "    dry_run: false\n"
+                "    strategies: [...]"
+            )
+
+        if len(accounts) == 0:
+            raise ValueError("Accounts list is empty! At least one account required.")
+
+        return accounts
+
+    def get_account_credentials(self, api_key_env: str, api_secret_env: str) -> tuple[str, str]:
+        """
+        Get API credentials by environment variable names
+
+        Args:
+            api_key_env: Environment variable name for API key (e.g., "1_BYBIT_API_KEY")
+            api_secret_env: Environment variable name for API secret (e.g., "1_BYBIT_API_SECRET")
+
+        Returns:
+            Tuple of (api_key, api_secret)
+
+        Raises:
+            ValueError: If credentials not found in environment
+        """
+        api_key = os.getenv(api_key_env, '')
+        api_secret = os.getenv(api_secret_env, '')
+
+        if not api_key or not api_secret:
+            raise ValueError(
+                f"API credentials not found!\n"
+                f"Please set {api_key_env} and {api_secret_env} in .env file\n"
+                f"\n"
+                f"Example in .env:\n"
+                f"  {api_key_env}=your_key_here\n"
+                f"  {api_secret_env}=your_secret_here\n"
+                f"\n"
+                f"Get demo keys from: https://testnet.bybit.com"
+            )
+
+        return api_key, api_secret
+
+    def validate_account_config(self, account_config: Dict) -> None:
+        """
+        Validate account configuration
+
+        Args:
+            account_config: Account configuration dict
+
+        Raises:
+            ValueError: If config is invalid
+        """
+        # Required fields
+        required_fields = ['id', 'name', 'api_key_env', 'api_secret_env',
+                          'demo_trading', 'strategies']
+
+        for field in required_fields:
+            if field not in account_config:
+                raise ValueError(
+                    f"Account config missing required field: '{field}'\n"
+                    f"Account: {account_config.get('name', 'unknown')}"
+                )
+
+        # Validate ID
+        account_id = account_config['id']
+        if not isinstance(account_id, int) or account_id < 1:
+            raise ValueError(
+                f"Account 'id' must be positive integer (1-999), got: {account_id}"
+            )
+
+        # Validate strategies
+        strategies = account_config.get('strategies')
+        if not strategies or not isinstance(strategies, list) or len(strategies) == 0:
+            raise ValueError(
+                f"Account {account_id} ({account_config['name']}) has no strategies!"
+            )
+
+        # risk_management is optional (deprecated fields are no longer required)
+        # No need to validate max_total_exposure, liquidation_buffer (deprecated)

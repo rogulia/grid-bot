@@ -48,14 +48,15 @@ class Position:
 class PositionManager:
     """Manage LONG and SHORT positions separately"""
 
-    def __init__(self, leverage: int = 100, symbol: Optional[str] = None, enable_state_persistence: bool = True):
+    def __init__(self, leverage: int = 100, symbol: Optional[str] = None, enable_state_persistence: bool = True, state_manager: Optional[StateManager] = None):
         """
         Initialize position manager
 
         Args:
             leverage: Trading leverage
             symbol: Trading symbol (e.g., SOLUSDT) - required for multi-symbol support
-            enable_state_persistence: Enable saving state to JSON
+            enable_state_persistence: Enable saving state to JSON (only if state_manager not provided)
+            state_manager: Optional pre-configured StateManager (for multi-account support)
         """
         self.logger = logging.getLogger("sol-trader.position_manager")
         self.leverage = leverage
@@ -72,11 +73,17 @@ class PositionManager:
         self.long_tp_order_id: Optional[str] = None
         self.short_tp_order_id: Optional[str] = None
 
-        # State persistence
-        self.state_manager = StateManager(symbol=symbol) if enable_state_persistence else None
-        if self.state_manager:
+        # State persistence (use provided state_manager or create new one)
+        if state_manager:
+            self.state_manager = state_manager
+            self.logger.info(f"Using provided state manager" +
+                           (f" for {symbol}" if symbol else ""))
+        elif enable_state_persistence:
+            self.state_manager = StateManager(symbol=symbol)
             self.logger.info(f"State persistence enabled" +
                            (f" for {symbol}" if symbol else ""))
+        else:
+            self.state_manager = None
 
     def add_position(
         self,

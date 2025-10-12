@@ -1,10 +1,10 @@
-"""Main entry point for SOL-Trader bot"""
+"""Multi-Account Trading Bot - Main Entry Point"""
 
 import asyncio
 import json
+import logging
 import signal
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -12,300 +12,254 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.utils.config_loader import ConfigLoader
-from src.utils.logger import setup_logger, log_position_state
-from src.exchange.bybit_client import BybitClient
-from src.exchange.bybit_websocket import BybitWebSocket
-from src.strategy.position_manager import PositionManager
-from src.strategy.grid_strategy import GridStrategy
-from src.analytics.metrics_tracker import MetricsTracker
+from src.core.multi_account_bot import MultiAccountBot
+from src.core.trading_account import TradingAccount
+from src.utils.timezone import now_helsinki
+from src.utils.logger import HelsinkiFormatter
 
 
-class TradingBot:
-    """Main trading bot orchestrator (Multi-symbol support)"""
+class MultiAccountOrchestrator:
+    """
+    Main orchestrator for multi-account trading bot
+
+    Manages multiple trading accounts with:
+    - Per-account logging (separate log files)
+    - WebSocket sharing (one WebSocket per unique (symbol, environment))
+    - Complete data isolation between accounts
+    - Emergency stop detection
+    """
 
     def __init__(self):
+        """Initialize orchestrator"""
         self.config = ConfigLoader()
-        self.logger = setup_logger(
-            log_level=self.config.get('bot.log_level', 'INFO')
-        )
 
-        # Shared components (one per bot instance)
-        self.client: BybitClient = None
-        self.metrics_tracker: MetricsTracker = None
+        # Setup main system logger
+        self.logger = self._setup_main_logger()
 
-        # Per-symbol components (one per trading symbol)
-        self.strategies: dict[str, GridStrategy] = {}  # {symbol: GridStrategy}
-        self.position_managers: dict[str, PositionManager] = {}  # {symbol: PositionManager}
-        self.websockets: dict[str, BybitWebSocket] = {}  # {symbol: WebSocket}
-        self.last_log_times: dict[str, float] = {}  # {symbol: last_log_timestamp}
-
-        # Daily summary report tracking
-        self.last_summary_report_date: str = None  # Track last report date (YYYY-MM-DD)
-        self.bot_start_time: float = time.time()  # Track bot start time
+        # Multi-account bot
+        self.bot = MultiAccountBot()
 
         self.running = False
 
-    async def initialize(self):
-        """Initialize all components"""
-        try:
-            self.logger.info("=" * 60)
-            self.logger.info("🤖 SOL-Trader Bot Starting (Multi-Symbol)...")
-            self.logger.info("=" * 60)
+        # Daily report tracking
+        self.last_report_date = None
+        self.last_check_minute = None
 
-            # Check for emergency stop flag (prevents restart after critical failures)
-            emergency_flag = Path("data/.emergency_stop")
-            if emergency_flag.exists():
-                try:
-                    with open(emergency_flag, 'r') as f:
-                        flag_data = json.load(f)
-
-                    self.logger.critical("=" * 60)
-                    self.logger.critical("🚨 EMERGENCY STOP FLAG DETECTED")
-                    self.logger.critical("=" * 60)
-                    self.logger.critical(f"Timestamp: {flag_data.get('timestamp', 'unknown')}")
-                    self.logger.critical(f"Symbol: {flag_data.get('symbol', 'unknown')}")
-                    self.logger.critical(f"Reason: {flag_data.get('reason', 'unknown')}")
-                    self.logger.critical("=" * 60)
-                    self.logger.critical("Bot will NOT start. Please:")
-                    self.logger.critical("1. Review the issue and fix it")
-                    self.logger.critical("2. Ensure sufficient balance")
-                    self.logger.critical("3. Remove the flag file: rm data/.emergency_stop")
-                    self.logger.critical("4. Restart the bot")
-                    self.logger.critical("=" * 60)
-                except Exception as e:
-                    self.logger.critical(f"Emergency flag exists but couldn't read it: {e}")
-
-                # Exit with code 0 (success) so systemd doesn't restart with Restart=on-failure
-                sys.exit(0)
-
-            # Get API credentials
-            api_key, api_secret = self.config.get_api_credentials()
-
-            # Get all strategies
-            strategies_config = self.config.get_strategies_config()
-            if not strategies_config:
-                raise ValueError("No strategies configured! Check config/config.yaml")
-
-            risk_config = self.config.get_risk_config()
-            bot_config = self.config.get_bot_config()
-            dry_run = bot_config.get('dry_run', True)
-            demo = self.config.is_demo()
-
-            self.logger.info(f"🎯 Trading {len(strategies_config)} symbol(s)")
-            self.logger.info(f"🔧 Mode: {'DRY RUN' if dry_run else 'LIVE'}")
-            self.logger.info(f"💰 Environment: {'DEMO' if demo else 'PRODUCTION'}")
-
-            # Initialize Bybit client (shared across all symbols)
-            self.logger.info("Initializing Bybit client...")
-            self.client = BybitClient(
-                api_key=api_key,
-                api_secret=api_secret,
-                demo=demo
-            )
-
-            # Get real account balance for analytics (REQUIRED - no fallback!)
-            self.logger.info("Fetching account balance...")
-            balance_data = self.client.get_wallet_balance()
-            if not balance_data:
-                raise RuntimeError("Failed to get wallet balance from exchange - cannot start bot")
-
-            accounts = balance_data.get('list', balance_data.get('result', {}).get('list', []))
-            if not accounts:
-                raise RuntimeError("No accounts found in wallet balance response - cannot start bot")
-
-            if 'totalEquity' not in accounts[0]:
-                raise RuntimeError("Account balance missing 'totalEquity' field - cannot start bot")
-
-            initial_balance = float(accounts[0]['totalEquity'])
-            self.logger.info(f"💰 Account Balance: ${initial_balance:.2f}")
-
-            # Initialize metrics tracker (shared across all symbols)
-            self.logger.info("Initializing metrics tracker...")
-            self.metrics_tracker = MetricsTracker(initial_balance=initial_balance)
-
-            # Initialize each trading symbol
-            for strategy_config in strategies_config:
-                symbol = strategy_config['symbol']
-                leverage = strategy_config['leverage']
-                category = strategy_config.get('category', 'linear')
-
-                self.logger.info("=" * 60)
-                self.logger.info(f"📊 Initializing {symbol}")
-                self.logger.info(f"⚡ Leverage: {leverage}x")
-                self.logger.info("=" * 60)
-
-                # Set position mode to Hedge Mode (required for dual-sided trading)
-                if not dry_run:
-                    self.client.set_position_mode(symbol, mode=3, category=category)  # 3 = Hedge Mode
-                else:
-                    self.logger.info(f"[DRY RUN] Would set position mode to Hedge Mode")
-
-                # Set leverage for this symbol
-                if not dry_run:
-                    self.client.set_leverage(symbol, leverage, category)
-                else:
-                    self.logger.info(f"[DRY RUN] Would set leverage to {leverage}x")
-
-                # Initialize position manager for this symbol
-                self.position_managers[symbol] = PositionManager(
-                    leverage=leverage,
-                    symbol=symbol
-                )
-
-                # Initialize strategy for this symbol
-                combined_config = {**strategy_config, **risk_config}
-                self.strategies[symbol] = GridStrategy(
-                    client=self.client,
-                    position_manager=self.position_managers[symbol],
-                    config=combined_config,
-                    dry_run=dry_run,
-                    metrics_tracker=self.metrics_tracker
-                )
-
-                # Get initial price
-                ticker = self.client.get_ticker(symbol, category)
-                if ticker:
-                    initial_price = float(ticker['lastPrice'])
-                    self.logger.info(f"💵 Initial price: ${initial_price:.4f}")
-                else:
-                    raise Exception(f"Failed to get initial price for {symbol}")
-
-                # Sync positions with exchange
-                self.strategies[symbol].sync_with_exchange(initial_price)
-
-                # Initialize WebSocket for this symbol
-                def make_price_callback(sym):
-                    """Create price callback closure for this symbol"""
-                    return lambda price: self.on_price_update(sym, price)
-
-                self.websockets[symbol] = BybitWebSocket(
-                    symbol=symbol,
-                    price_callback=make_price_callback(symbol),
-                    demo=demo,
-                    channel_type=category
-                )
-                self.websockets[symbol].start()
-
-                # Initialize last log time
-                self.last_log_times[symbol] = 0
-
-                self.logger.info(f"✅ {symbol} initialized successfully!")
-
-            self.logger.info("=" * 60)
-            self.logger.info("✅ Bot initialized successfully!")
-            self.logger.info("=" * 60)
-
-        except Exception as e:
-            self.logger.error(f"Failed to initialize bot: {e}", exc_info=True)
-            raise
-
-    def on_price_update(self, symbol: str, price: float):
+    def _setup_main_logger(self) -> logging.Logger:
         """
-        Callback for price updates from WebSocket
+        Setup main system logger for orchestrator
+
+        Logs go to: logs/main_{date}.log
+
+        Returns:
+            Configured logger instance
+        """
+        log_dir = Path("logs")
+        log_dir.mkdir(exist_ok=True)
+
+        today = now_helsinki().strftime("%Y-%m-%d")
+
+        logger = logging.getLogger("main")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+
+        # File handler: main_2025-10-10.log
+        file_handler = logging.FileHandler(log_dir / f"main_{today}.log")
+        formatter = HelsinkiFormatter(
+            '%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+        # Console handler (for systemd/screen)
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+        return logger
+
+    def _check_and_generate_daily_reports(self, force_yesterday: bool = False):
+        """
+        Check if daily reports need to be generated
 
         Args:
-            symbol: Trading symbol (e.g., SOLUSDT)
-            price: Current market price
+            force_yesterday: If True, generate report for yesterday regardless of time
+                            (used on startup to catch missed reports)
         """
-        try:
-            # Get components for this symbol
-            strategy = self.strategies.get(symbol)
-            position_manager = self.position_managers.get(symbol)
+        now = now_helsinki()
+        today = now.strftime("%Y-%m-%d")
+        current_minute = now.strftime("%H:%M")
 
-            if not strategy or not position_manager:
-                self.logger.error(f"No strategy/position_manager for {symbol}")
-                return
+        # Prevent multiple checks in the same minute
+        if not force_yesterday and current_minute == self.last_check_minute:
+            return
 
-            # Check if strategy is in emergency stop state
-            if strategy.is_stopped():
+        self.last_check_minute = current_minute
+
+        # Determine which date to report
+        if force_yesterday:
+            # On startup: check yesterday
+            from datetime import timedelta
+            yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+            report_date = yesterday
+            reason = "startup check"
+        elif current_minute in ["00:01", "00:02"]:
+            # At 00:01-00:02: report yesterday
+            from datetime import timedelta
+            yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+            report_date = yesterday
+            reason = "scheduled"
+        else:
+            # Not time to generate reports
+            return
+
+        # Skip if already generated today
+        if self.last_report_date == report_date:
+            return
+
+        self.logger.info(f"📊 Generating daily reports for {report_date} ({reason})...")
+
+        # Generate reports for all accounts
+        generated_count = 0
+        for account in self.bot.accounts:
+            try:
+                result = account.generate_daily_report(report_date)
+                if result:
+                    generated_count += 1
+            except Exception as e:
                 self.logger.error(
-                    f"[{symbol}] Strategy in emergency stop state - stopping bot!"
+                    f"Failed to generate daily report for account {account.id_str}: {e}"
                 )
-                self.running = False
-                return
 
-            # Execute strategy
-            strategy.on_price_update(price)
+        if generated_count > 0:
+            self.logger.info(f"✅ Generated {generated_count} daily report(s) for {report_date}")
+            self.last_report_date = report_date
+        else:
+            self.logger.info(f"No data found for {report_date}, skipping reports")
 
-            # Log position state and sync periodically (every 60 seconds)
-            current_time = time.time()
-            last_log_time = self.last_log_times.get(symbol, 0)
+    async def initialize(self):
+        """Initialize all accounts"""
+        self.logger.info("=" * 80)
+        self.logger.info("🤖 SOL-Trader Multi-Account Bot Starting...")
+        self.logger.info("=" * 80)
 
-            if current_time - last_log_time >= 60:
-                # Sync positions with exchange (reopens if TP executed)
-                strategy.sync_with_exchange(price)
+        try:
+            # Load accounts configuration
+            accounts_config = self.config.get_accounts_config()
 
-                long_pnl = position_manager.calculate_pnl(price, 'Buy')
-                short_pnl = position_manager.calculate_pnl(price, 'Sell')
+            self.logger.info(f"📊 Total Accounts: {len(accounts_config)}")
+            self.logger.info("")
 
-                self.logger.info(f"[{symbol}] Price: ${price:.4f} | "
-                               f"LONG PnL: ${long_pnl:.2f} | SHORT PnL: ${short_pnl:.2f}")
+            # ⚠️ Pre-check emergency stop files
+            emergency_accounts = []
+            for acc_config in accounts_config:
+                account_id = acc_config['id']
+                id_str = f"{account_id:03d}"
+                emergency_file = Path(f"data/.{id_str}_emergency_stop")
 
-                # Логировать unrealized PnL с учетом fees (для live trading)
-                if not strategy.dry_run:
-                    for side_name, side in [('LONG', 'Buy'), ('SHORT', 'Sell')]:
-                        if position_manager.get_total_quantity(side) > 0:
-                            try:
-                                # Получить данные позиции с биржи
-                                position_data = client.get_active_position(symbol, side)
-                                if position_data:
-                                    exchange_unrealized = float(position_data.get('unrealisedPnl', 0))
+                if emergency_file.exists():
+                    try:
+                        with open(emergency_file) as f:
+                            data = json.load(f)
+                        emergency_accounts.append((id_str, acc_config['name'], data))
+                    except Exception as e:
+                        self.logger.error(f"❌ Failed to read emergency stop file {emergency_file}: {e}")
+                        emergency_accounts.append((id_str, acc_config['name'], {'reason': 'unknown', 'timestamp': 'unknown'}))
 
-                                    # Рассчитать с учетом fees
-                                    pnl_info = position_manager.calculate_unrealized_pnl_with_fees(
-                                        price, side, exchange_unrealized
-                                    )
+            if emergency_accounts:
+                self.logger.error("=" * 80)
+                self.logger.error("🚨 EMERGENCY STOP FLAGS DETECTED:")
+                self.logger.error("=" * 80)
 
-                                    if pnl_info['base_pnl'] != 0:  # Только если есть позиция
-                                        self.logger.info(
-                                            f"[{symbol}] {side_name} Unrealized PnL: "
-                                            f"Base=${pnl_info['base_pnl']:.4f}, "
-                                            f"Est.Open Fee=${pnl_info['estimated_open_fee']:.4f}, "
-                                            f"Est.Close Fee=${pnl_info['estimated_close_fee']:.4f}, "
-                                            f"NET=${pnl_info['net_pnl']:.4f}"
-                                        )
-                            except Exception as e:
-                                self.logger.debug(f"Could not calculate unrealized PnL with fees for {side_name}: {e}")
+                for id_str, name, data in emergency_accounts:
+                    self.logger.error(f"\nAccount {id_str}: {name}")
+                    self.logger.error(f"  File: data/.{id_str}_emergency_stop")
+                    self.logger.error(f"  Timestamp: {data.get('timestamp', 'unknown')}")
+                    self.logger.error(f"  Reason: {data.get('reason', 'unknown')}")
+                    self.logger.error(f"  Symbol: {data.get('symbol', 'N/A')}")
 
-                # Log metrics snapshot to CSV
-                if self.metrics_tracker:
-                    self.metrics_tracker.log_snapshot(
-                        symbol=symbol,
-                        price=price,
-                        long_positions=len(position_manager.long_positions),
-                        short_positions=len(position_manager.short_positions),
-                        long_qty=position_manager.get_total_quantity('Buy'),
-                        short_qty=position_manager.get_total_quantity('Sell'),
-                        long_pnl=long_pnl,
-                        short_pnl=short_pnl
+                self.logger.error("\n" + "=" * 80)
+                self.logger.error("⚠️  Fix issues and remove emergency stop files:")
+                for id_str, _, _ in emergency_accounts:
+                    self.logger.error(f"   rm data/.{id_str}_emergency_stop")
+                self.logger.error("=" * 80)
+
+                raise RuntimeError(
+                    f"{len(emergency_accounts)} account(s) in emergency stop state. "
+                    "Fix issues and remove flags before restarting."
+                )
+
+            # Initialize each account
+            for acc_config in accounts_config:
+                try:
+                    # Validate config
+                    self.config.validate_account_config(acc_config)
+
+                    account_id = acc_config['id']
+                    name = acc_config['name']
+
+                    # Get credentials
+                    api_key, api_secret = self.config.get_account_credentials(
+                        acc_config['api_key_env'],
+                        acc_config['api_secret_env']
                     )
 
-                # Generate daily summary report (once per day, but not on first run)
-                current_date = datetime.now().strftime('%Y-%m-%d')
+                    demo = acc_config['demo_trading']
+                    dry_run = acc_config.get('dry_run', False)
+                    risk_config = acc_config.get('risk_management', {})
 
-                # Initialize last_summary_report_date on first periodic check (prevents immediate report)
-                if self.last_summary_report_date is None:
-                    self.last_summary_report_date = current_date
-                    self.logger.debug(f"Initialized summary report tracking for {current_date}")
+                    id_str = f"{account_id:03d}"
+                    self.logger.info(f"🔧 Initializing Account {id_str}: {name}")
+                    self.logger.info(f"   Environment: {'DEMO' if demo else 'PRODUCTION ⚠️'}")
+                    self.logger.info(f"   Mode: {'DRY RUN' if dry_run else 'LIVE'}")
+                    self.logger.info(f"   Strategies: {len(acc_config['strategies'])} symbol(s)")
 
-                # Generate report only when date changes (new day)
-                if self.last_summary_report_date != current_date:
-                    if self.metrics_tracker:
-                        self.logger.info(f"📊 Generating daily summary report for {self.last_summary_report_date}...")
-                        try:
-                            # Generate report for PREVIOUS day
-                            summary = self.metrics_tracker.save_summary_report(date_suffix=self.last_summary_report_date)
-                            self.logger.info(
-                                f"💾 Daily report saved: summary_report_{self.last_summary_report_date}.json/.txt"
-                            )
-                            self.last_summary_report_date = current_date
-                        except Exception as e:
-                            self.logger.error(f"Failed to generate daily summary report: {e}")
+                    # Create trading account
+                    account = TradingAccount(
+                        account_id=account_id,
+                        name=name,
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        demo=demo,
+                        dry_run=dry_run,
+                        strategies_config=acc_config['strategies'],
+                        risk_config=risk_config
+                    )
 
-                self.last_log_times[symbol] = current_time
+                    # Initialize account
+                    await account.initialize()
+
+                    # Register with multi-account bot
+                    self.bot.register_account(account)
+
+                    self.logger.info(f"✅ Account {id_str} ready")
+                    self.logger.info("")
+
+                except Exception as e:
+                    account_name = acc_config.get('name', 'unknown')
+                    self.logger.error(f"❌ Failed to initialize account '{account_name}': {e}", exc_info=True)
+                    raise
+
+            # Print statistics
+            stats = self.bot.get_stats()
+            self.logger.info("=" * 80)
+            self.logger.info("📊 Bot Statistics:")
+            self.logger.info(f"   Total Accounts: {stats['total_accounts']}")
+            self.logger.info(f"   Total WebSockets: {stats['total_websockets']}")
+            self.logger.info("   WebSocket Distribution:")
+            for ws_key, subscriber_count in stats['websocket_breakdown'].items():
+                self.logger.info(f"      {ws_key}: {subscriber_count} account(s)")
+            self.logger.info("=" * 80)
+            self.logger.info("✅ All accounts initialized successfully!")
+            self.logger.info("=" * 80)
+
+            # Check for missing daily reports (in case bot was restarted)
+            self._check_and_generate_daily_reports(force_yesterday=True)
 
         except Exception as e:
-            self.logger.error(f"Error in price update handler for {symbol}: {e}", exc_info=True)
+            self.logger.error(f"❌ Failed to initialize bot: {e}", exc_info=True)
+            raise
 
     async def run(self):
         """Main run loop"""
@@ -314,87 +268,56 @@ class TradingBot:
         try:
             await self.initialize()
 
-            self.logger.info("🚀 Bot is now running. Press Ctrl+C to stop.")
+            self.logger.info("🚀 Bot is running. Press Ctrl+C to stop.")
+            self.logger.info("")
 
             # Keep running
+            check_counter = 0
             while self.running:
                 await asyncio.sleep(1)
+
+                # Check for daily reports every 60 seconds
+                check_counter += 1
+                if check_counter >= 60:
+                    self._check_and_generate_daily_reports()
+                    check_counter = 0
 
         except KeyboardInterrupt:
             self.logger.info("\n⏹️  Shutdown signal received...")
         except Exception as e:
-            self.logger.error(f"Fatal error: {e}", exc_info=True)
+            self.logger.error(f"❌ Fatal error: {e}", exc_info=True)
         finally:
             await self.shutdown()
 
     async def shutdown(self):
         """Graceful shutdown"""
-        self.logger.info("=" * 60)
+        self.logger.info("=" * 80)
         self.logger.info("🛑 Shutting down bot...")
-        self.logger.info("=" * 60)
+        self.logger.info("=" * 80)
 
         self.running = False
 
-        # Stop all WebSockets
-        for symbol, websocket in self.websockets.items():
-            self.logger.info(f"Stopping WebSocket for {symbol}...")
-            websocket.stop()
+        # Shutdown multi-account bot (will shutdown all accounts and WebSockets)
+        await self.bot.shutdown()
 
-        # Log final state for each symbol
-        for symbol in self.strategies.keys():
-            position_manager = self.position_managers.get(symbol)
-            websocket = self.websockets.get(symbol)
-
-            if position_manager and websocket:
-                current_price = websocket.get_current_price()
-                if current_price > 0:
-                    long_pnl = position_manager.calculate_pnl(current_price, 'Buy')
-                    short_pnl = position_manager.calculate_pnl(current_price, 'Sell')
-                    total_pnl = long_pnl + short_pnl
-
-                    self.logger.info("=" * 60)
-                    self.logger.info(f"📊 FINAL STATE - {symbol}")
-                    self.logger.info("=" * 60)
-                    self.logger.info(f"Final Price: ${current_price:.4f}")
-                    self.logger.info(f"LONG Positions: {len(position_manager.long_positions)}")
-                    self.logger.info(f"SHORT Positions: {len(position_manager.short_positions)}")
-                    self.logger.info(f"LONG PnL: ${long_pnl:.2f}")
-                    self.logger.info(f"SHORT PnL: ${short_pnl:.2f}")
-                    self.logger.info(f"TOTAL PnL: ${total_pnl:.2f}")
-                    self.logger.info("=" * 60)
-
-                    # Log final metrics snapshot
-                    if self.metrics_tracker:
-                        self.metrics_tracker.log_snapshot(
-                            symbol=symbol,
-                            price=current_price,
-                            long_positions=len(position_manager.long_positions),
-                            short_positions=len(position_manager.short_positions),
-                            long_qty=position_manager.get_total_quantity('Buy'),
-                            short_qty=position_manager.get_total_quantity('Sell'),
-                            long_pnl=long_pnl,
-                            short_pnl=short_pnl
-                        )
-
-        # Summary reports are now generated daily (see on_price_update handler)
-        # No need to generate on shutdown - prevents report spam on frequent restarts
-
+        self.logger.info("=" * 80)
         self.logger.info("✅ Bot stopped gracefully")
+        self.logger.info("=" * 80)
 
 
 def main():
     """Entry point"""
-    bot = TradingBot()
+    orchestrator = MultiAccountOrchestrator()
 
     # Setup signal handlers for graceful shutdown
     def signal_handler(sig, frame):
-        bot.running = False
+        orchestrator.running = False
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
     # Run bot
-    asyncio.run(bot.run())
+    asyncio.run(orchestrator.run())
 
 
 if __name__ == "__main__":

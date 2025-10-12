@@ -20,7 +20,9 @@ class GridStrategy:
         position_manager: PositionManager,
         config: dict,
         dry_run: bool = True,
-        metrics_tracker: Optional['MetricsTracker'] = None
+        metrics_tracker: Optional['MetricsTracker'] = None,
+        account_id: int = 0,
+        account_logger: Optional[logging.Logger] = None
     ):
         """
         Initialize grid strategy
@@ -31,8 +33,17 @@ class GridStrategy:
             config: Strategy configuration
             dry_run: Dry run mode (no real orders)
             metrics_tracker: Optional metrics tracker for analytics
+            account_id: Account ID (for multi-account support)
+            account_logger: Logger from TradingAccount (logs to per-account files)
         """
-        self.logger = logging.getLogger("sol-trader.grid_strategy")
+        # Account identification
+        self.account_id = account_id
+        self.id_str = f"{account_id:03d}"  # Zero-padded ID for files
+
+        # Use account's logger (writes to per-account log files)
+        # If not provided, fall back to default logger
+        self.logger = account_logger or logging.getLogger("sol-trader.grid_strategy")
+
         self.client = client
         self.pm = position_manager
         self.dry_run = dry_run
@@ -55,6 +66,8 @@ class GridStrategy:
         self.liquidation_buffer = config.get('liquidation_buffer', 0.8)
         # max_exposure: no limit by default (works with any balance!)
         self.max_exposure = config.get('max_total_exposure', float('inf'))
+        # MM rate threshold for emergency close (configurable per account)
+        self.mm_rate_threshold = config.get('mm_rate_threshold', 90.0)
 
         # Get instrument info from Bybit API
         self._load_instrument_info()
@@ -67,6 +80,11 @@ class GridStrategy:
             'liquidation': 0
         }
         self._warning_interval = 60  # Log warnings max once per 60 seconds
+
+        # Throttling for MM Rate checks (to avoid API rate limits)
+        self._cached_mm_rate: Optional[float] = None
+        self._last_mm_rate_check_time: float = 0
+        self._mm_rate_check_interval: float = 30.0  # Check every 30 seconds
 
         # Emergency stop flag - prevents any operations after critical failure
         self.emergency_stopped = False
@@ -210,11 +228,14 @@ class GridStrategy:
         from datetime import datetime
         from pathlib import Path
 
-        flag_file = Path("data/.emergency_stop")
+        # Per-account emergency stop file: data/.{ID}_emergency_stop
+        flag_file = Path(f"data/.{self.id_str}_emergency_stop")
         flag_file.parent.mkdir(parents=True, exist_ok=True)
 
+        from ..utils.timezone import now_helsinki
         flag_content = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_helsinki().isoformat(),
+            "account_id": self.account_id,
             "symbol": self.symbol,
             "reason": reason
         }
@@ -225,9 +246,10 @@ class GridStrategy:
 
         self.logger.critical(
             f"🚨 [{self.symbol}] EMERGENCY STOP FLAG CREATED: {flag_file}\n"
+            f"   Account ID: {self.id_str}\n"
             f"   Reason: {reason}\n"
             f"   Bot will not restart automatically.\n"
-            f"   Fix issues and remove this file before restarting."
+            f"   Fix issues and remove file: rm {flag_file}"
         )
 
     def _restore_positions_from_order_history(self, side: str, exchange_qty: float, exchange_avg_price: float) -> bool:
@@ -476,40 +498,80 @@ class GridStrategy:
                     close_fee = 0.0
                     funding_fee = 0.0
                     close_reason = "Unknown (exchange close)"
+                    close_timestamp = None  # Will be set from Bybit if available
 
                     if not self.dry_run:
                         try:
-                            # Wait for exchange to process
+                            # Wait for exchange to process (increased for reliability)
                             import time
-                            time.sleep(1)
+                            time.sleep(2)
 
-                            # Get last closed PnL record
-                            closed_records = self.client.get_closed_pnl(self.symbol, limit=1)
+                            # Get recent closed PnL records (limit=20 to find correct match)
+                            closed_records = self.client.get_closed_pnl(self.symbol, limit=20)
+
+                            record = None
+                            record_index = -1
+                            avg_exit = current_price  # Fallback to WebSocket price
+
                             if closed_records:
-                                record = closed_records[0]
+                                import time as time_module
+                                current_time = time_module.time() * 1000  # milliseconds
+
+                                # Find matching record by side, quantity, and recency
+                                for idx, rec in enumerate(closed_records):
+                                    rec_side = rec.get('side')
+                                    rec_qty = float(rec.get('closedSize', 0))
+                                    rec_time = int(rec.get('updatedTime', 0))
+
+                                    # Check: same side, same qty (with tolerance), within 60 seconds
+                                    time_diff_sec = (current_time - rec_time) / 1000
+
+                                    if (rec_side == side and
+                                        abs(rec_qty - local_qty) < 0.01 and
+                                        time_diff_sec < 60):
+                                        record = rec
+                                        record_index = idx
+                                        break
+
+                                # Fallback to first record if no exact match
+                                if record is None:
+                                    self.logger.warning(
+                                        f"⚠️  [{self.symbol}] No exact match in closed PnL (side={side}, qty={local_qty}), "
+                                        f"using most recent record"
+                                    )
+                                    record = closed_records[0]
+                                    record_index = 0
+
+                            if record:
                                 actual_pnl = float(record.get('closedPnl', 0))
                                 open_fee = float(record.get('openFee', 0))
                                 close_fee = float(record.get('closeFee', 0))
-
-                                # Determine close reason by comparing exit vs entry prices
-                                # For SHORT: exitPrice < entryPrice = profit (sold high, bought back low)
-                                # For LONG: exitPrice > entryPrice = profit (bought low, sold high)
                                 avg_entry = float(record.get('avgEntryPrice', 0))
                                 avg_exit = float(record.get('avgExitPrice', 0))
 
-                                if side == 'Buy':  # LONG position
-                                    is_profitable = avg_exit > avg_entry
-                                else:  # SHORT position
-                                    is_profitable = avg_exit < avg_entry
+                                # Extract timestamp from Bybit (updatedTime in milliseconds)
+                                updated_time_ms = int(record.get('updatedTime', 0))
+                                if updated_time_ms > 0:
+                                    # Convert to datetime and format in Helsinki timezone
+                                    from datetime import datetime
+                                    import pytz
+                                    from ..utils.timezone import format_helsinki
 
-                                if is_profitable:
+                                    utc_dt = datetime.fromtimestamp(updated_time_ms / 1000, tz=pytz.UTC)
+                                    close_timestamp = format_helsinki(utc_dt)
+                                else:
+                                    close_timestamp = None  # Fallback to current time in log_trade
+
+                                # Determine close reason using actual PnL (most reliable)
+                                if actual_pnl > 0:
                                     price_diff_pct = abs((avg_exit - avg_entry) / avg_entry * 100)
                                     close_reason = f"Take Profit ({price_diff_pct:.2f}%)"
                                 else:
                                     close_reason = "Stop-Loss or Liquidation"
 
-                                self.logger.error(
-                                    f"💥 [{self.symbol}] {side} CLOSED ON EXCHANGE: "
+                                self.logger.info(
+                                    f"💰 [{self.symbol}] {side} CLOSED ON EXCHANGE (record #{record_index}): "
+                                    f"Entry: ${avg_entry:.4f}, Exit: ${avg_exit:.4f}, "
                                     f"PnL=${actual_pnl:.4f} ({close_reason}), "
                                     f"Open Fee=${open_fee:.4f}, Close Fee=${close_fee:.4f}"
                                 )
@@ -526,13 +588,14 @@ class GridStrategy:
                             symbol=self.symbol,
                             side=close_side_name,
                             action="CLOSE",
-                            price=current_price,
+                            price=avg_exit,  # Use real exit price from Bybit, not WebSocket price
                             quantity=local_qty,
                             reason=close_reason,
                             pnl=actual_pnl,
                             open_fee=open_fee,
                             close_fee=close_fee,
-                            funding_fee=funding_fee
+                            funding_fee=funding_fee,
+                            timestamp=close_timestamp  # Use Bybit close time, not detection time
                         )
 
                     # NOW remove local tracking
@@ -616,6 +679,197 @@ class GridStrategy:
                         break
             except Exception as e:
                 self.logger.warning(f"[{self.symbol}] Could not log MM Rate: {e}")
+
+    def on_execution(self, exec_data: dict):
+        """
+        Handle execution event from Private WebSocket
+
+        Processes real-time execution data from Bybit. Replaces polling-based
+        detection from sync_with_exchange().
+
+        Args:
+            exec_data: Execution data from Bybit WebSocket
+        """
+        try:
+            # Validate required fields (FAIL-FAST)
+            required_fields = ['symbol', 'side', 'execPrice', 'execQty', 'execTime']
+            missing = [f for f in required_fields if f not in exec_data]
+            if missing:
+                raise ValueError(f"Execution event missing required fields {missing}: {exec_data}")
+
+            symbol = exec_data['symbol']
+            side = exec_data['side']  # Buy or Sell (order side, not position side)
+            exec_price = float(exec_data['execPrice'])
+            exec_qty = float(exec_data['execQty'])
+            exec_time_ms = int(exec_data['execTime'])
+            closed_size = float(exec_data.get('closedSize', 0))
+            closed_pnl = float(exec_data.get('execPnl', 0))  # Use execPnl, not closedPnl!
+            exec_fee = float(exec_data.get('execFee', 0))
+
+            # Extract execution type and order details for close reason detection
+            exec_type = exec_data.get('execType', '')
+            order_type = exec_data.get('orderType', '')
+            stop_order_type = exec_data.get('stopOrderType', '')
+            order_link_id = exec_data.get('orderLinkId', '')
+
+            # Log execution details for debugging
+            self.logger.debug(
+                f"🔍 [{symbol}] Execution: execType={exec_type}, orderType={order_type}, "
+                f"stopOrderType={stop_order_type}, execPnl={closed_pnl:.4f}, "
+                f"closedSize={closed_size}, orderLinkId={order_link_id}"
+            )
+
+            # Check if this is a position close
+            is_close = closed_size > 0 or closed_pnl != 0
+
+            if not is_close:
+                # Position open/add - just log
+                self.logger.debug(
+                    f"📝 [{symbol}] {side} OPEN: qty={exec_qty} price={exec_price}"
+                )
+                return
+
+            # POSITION CLOSE - process with real data from exchange
+            self.logger.info(
+                f"💰 [{symbol}] {side} CLOSED via WebSocket: "
+                f"qty={closed_size} price={exec_price} pnl=${closed_pnl:.4f}"
+            )
+
+            # Convert timestamp to Helsinki timezone
+            from datetime import datetime
+            import pytz
+            from ..utils.timezone import format_helsinki
+
+            utc_dt = datetime.fromtimestamp(exec_time_ms / 1000, tz=pytz.UTC)
+            close_timestamp = format_helsinki(utc_dt)
+
+            # Determine which position side was closed
+            # Order side 'Sell' closes LONG, 'Buy' closes SHORT
+            closed_position_side = 'Buy' if side == 'Sell' else 'Sell'
+
+            # Get average entry price for percentage calculation
+            avg_entry = self.pm.get_average_entry_price(closed_position_side)
+            if not avg_entry:
+                avg_entry = exec_price  # Fallback if position not tracked
+
+            # Determine close reason using execType and other fields
+            if exec_type == 'BustTrade':
+                close_reason = "Liquidation"
+            elif exec_type == 'AdlTrade':
+                close_reason = "ADL (Auto-Deleveraging)"
+            elif exec_type == 'Funding':
+                # Funding fee - ignore, not a position close
+                self.logger.debug(f"🔔 [{symbol}] Funding fee event, ignoring")
+                return
+            elif exec_type == 'Trade':
+                # Regular trade - need to distinguish TP vs SL
+                if stop_order_type in ['StopLoss', 'TrailingStop']:
+                    close_reason = "Stop-Loss"
+                elif stop_order_type == 'TakeProfit':
+                    close_reason = "Take Profit (WebSocket)"
+                elif order_type == 'Limit' and closed_pnl > 0:
+                    # Our TP orders are Limit orders with positive PnL
+                    price_diff_pct = abs((exec_price - avg_entry) / avg_entry * 100)
+                    close_reason = f"Take Profit ({price_diff_pct:.2f}%)"
+                elif closed_pnl < 0:
+                    close_reason = "Stop-Loss or Manual Close"
+                else:
+                    close_reason = "Manual Close"
+            else:
+                # Unknown execType (Delivery, Settle, BlockTrade, etc.)
+                close_reason = f"Unknown ({exec_type})"
+
+            # Log to metrics tracker
+            if self.metrics_tracker:
+                self.metrics_tracker.log_trade(
+                    symbol=symbol,
+                    side=side,  # Order side (Sell for LONG close, Buy for SHORT close)
+                    action="CLOSE",
+                    price=exec_price,  # Real execution price from exchange
+                    quantity=closed_size,
+                    reason=close_reason,
+                    pnl=closed_pnl,  # Real PnL from exchange
+                    open_fee=0.0,  # Not provided in execution event
+                    close_fee=exec_fee,
+                    funding_fee=0.0,  # Not provided in execution event
+                    timestamp=close_timestamp  # Real timestamp from exchange
+                )
+
+            # 🚨 CRITICAL: Check if this was a liquidation or ADL
+            if close_reason == "Liquidation" or close_reason.startswith("ADL"):
+                reason = (
+                    f"Position liquidated! {closed_position_side} position on {symbol} was forcibly closed by exchange. "
+                    f"Liquidation PnL: ${closed_pnl:.2f}. Account balance critically low. "
+                    f"Review risk management and account balance before restarting."
+                )
+
+                self.logger.error(f"🚨 [{symbol}] LIQUIDATION DETECTED: {reason}")
+
+                # Create emergency stop flag to prevent restart
+                self._create_emergency_stop_flag(reason)
+                self.emergency_stopped = True
+
+                # Update local state - remove closed positions
+                self.pm.remove_all_positions(closed_position_side)
+                self.pm.set_tp_order_id(closed_position_side, None)
+
+                # STOP BOT IMMEDIATELY - this is critical!
+                raise RuntimeError(f"[{symbol}] {reason}")
+
+            # Update local state - remove closed positions
+            self.pm.remove_all_positions(closed_position_side)
+            self.pm.set_tp_order_id(closed_position_side, None)
+
+            # Reopen initial position if needed
+            # Get current price (could be from WebSocket or this execution price)
+            current_price = exec_price
+
+            # Check if we should reopen
+            if not self.emergency_stopped and not self.dry_run:
+                try:
+                    # Open new initial position at current market
+                    self.logger.info(
+                        f"🆕 [{symbol}] Reopening {closed_position_side} position after TP..."
+                    )
+
+                    qty = self._usd_to_qty(self.initial_size_usd, current_price)
+
+                    order_response = self.client.place_order(
+                        symbol=symbol,
+                        side=closed_position_side,
+                        order_type="Market",
+                        qty=qty,
+                        category=self.category
+                    )
+
+                    if order_response:
+                        self.pm.add_position(closed_position_side, current_price, qty, 0)
+                        self.logger.info(
+                            f"✅ [{symbol}] Reopened {closed_position_side}: "
+                            f"{qty} @ ${current_price:.4f}"
+                        )
+
+                        # Update TP order
+                        self._update_tp_order(closed_position_side)
+
+                        # Log to metrics
+                        if self.metrics_tracker:
+                            self.metrics_tracker.log_trade(
+                                symbol=symbol,
+                                side=closed_position_side,
+                                action="OPEN",
+                                price=current_price,
+                                quantity=qty,
+                                reason="Reopen after TP"
+                            )
+                except Exception as e:
+                    self.logger.error(f"❌ [{symbol}] Failed to reopen position: {e}")
+
+        except Exception as e:
+            self.logger.error(
+                f"❌ [{symbol}] Error processing execution event: {e}",
+                exc_info=True
+            )
 
     def _update_tp_order(self, side: str):
         """
@@ -723,8 +977,9 @@ class GridStrategy:
             # Check for grid entries (averaging)
             self._check_grid_entries(current_price)
 
-            # Check for take profit
-            self._check_take_profit(current_price)
+            # Take profit is now handled via Private WebSocket execution stream
+            # (on_execution() method) - NO FALLBACKS!
+            # Old polling-based _check_take_profit() is DISABLED
 
         except RuntimeError as e:
             # RuntimeError indicates critical failure - re-raise to stop bot
@@ -883,7 +1138,8 @@ class GridStrategy:
                 price=current_price,
                 qty=new_size,
                 reason=f"Grid level {grid_level}",
-                dry_run=self.dry_run
+                dry_run=self.dry_run,
+                account_prefix=f"{self.id_str}_"
             )
 
             # Log to metrics tracker
@@ -997,7 +1253,8 @@ class GridStrategy:
                 price=current_price,
                 qty=total_qty,
                 reason=f"Take Profit ({profit_pct:.2f}%, PnL: ${pnl:.2f})",
-                dry_run=self.dry_run
+                dry_run=self.dry_run,
+                account_prefix=f"{self.id_str}_"
             )
 
             # Log to metrics tracker with real PnL and fees from exchange
@@ -1049,7 +1306,8 @@ class GridStrategy:
                 price=current_price,
                 qty=initial_qty,
                 reason="Reopen after Take Profit",
-                dry_run=self.dry_run
+                dry_run=self.dry_run,
+                account_prefix=f"{self.id_str}_"
             )
 
             # Log to metrics tracker
@@ -1076,10 +1334,11 @@ class GridStrategy:
 
     def _check_risk_limits(self, current_price: float) -> bool:
         """
-        Check risk limits and close positions if necessary
+        Check risk limits (Account MM Rate only - balance checked before averaging)
 
-        For hedged positions (LONG+SHORT), checks Account Maintenance Margin Rate
-        instead of individual position liqPrice (which is meaningless for hedges).
+        For hedged positions (LONG+SHORT), monitors Account Maintenance Margin Rate
+        to detect liquidation risk. Checks are throttled to every 30 seconds to avoid
+        API rate limits (balance changes only on execution events, not price ticks).
 
         Args:
             current_price: Current market price
@@ -1087,39 +1346,38 @@ class GridStrategy:
         Returns:
             True if safe to continue, False if risk limits hit
         """
-        # Get wallet balance with Account Maintenance Margin Rate (REQUIRED - no fallback!)
-        available_balance = None
-        account_mm_rate = None
-
-        if not self.dry_run:
-            balance_info = self.client.get_wallet_balance(account_type="UNIFIED")
-            if balance_info and 'list' in balance_info:
-                for account in balance_info['list']:
-                    if account.get('accountType') == 'UNIFIED':
-                        # totalAvailableBalance = funds available for new positions
-                        available_balance = float(
-                            account.get('totalAvailableBalance', 0)
-                        )
-
-                        # accountMMRate = Account Maintenance Margin Rate (%)
-                        # This is the ONLY metric that matters for hedged positions!
-                        account_mm_rate_str = account.get('accountMMRate', '')
-                        if account_mm_rate_str and account_mm_rate_str != '':
-                            # Convert to percentage (Bybit returns as decimal, e.g. "0.0017" = 0.17%)
-                            account_mm_rate = float(account_mm_rate_str) * 100
-
-                        # Note: MM Rate is logged in sync_with_exchange() every 60s
-                        # to avoid spamming logs (this method is called every price update)
-                        break
-
-            if available_balance is None:
-                raise RuntimeError(
-                    f"[{self.symbol}] Failed to get wallet balance from exchange - cannot check risk limits"
-                )
-        else:
-            # In dry run, use mock values
-            available_balance = 1000.0
+        # In dry run, use mock value
+        if self.dry_run:
             account_mm_rate = 0.17  # Mock: safe value
+        else:
+            # Throttled check: only fetch from API every 30 seconds
+            current_time = time.time()
+            if current_time - self._last_mm_rate_check_time >= self._mm_rate_check_interval:
+                # Fetch fresh data from exchange
+                balance_info = self.client.get_wallet_balance(account_type="UNIFIED")
+                if balance_info and 'list' in balance_info:
+                    for account in balance_info['list']:
+                        if account.get('accountType') == 'UNIFIED':
+                            # accountMMRate = Account Maintenance Margin Rate (%)
+                            # This is the ONLY metric that matters for hedged positions!
+                            account_mm_rate_str = account.get('accountMMRate', '')
+                            if account_mm_rate_str and account_mm_rate_str != '':
+                                # Convert to percentage (Bybit returns as decimal, e.g. "0.0017" = 0.17%)
+                                self._cached_mm_rate = float(account_mm_rate_str) * 100
+                            else:
+                                self._cached_mm_rate = None
+                            break
+                else:
+                    # API failure - fail-fast (no fallbacks!)
+                    raise RuntimeError(
+                        f"[{self.symbol}] Failed to get wallet balance from exchange - cannot check risk limits"
+                    )
+
+                # Update last check time
+                self._last_mm_rate_check_time = current_time
+
+            # Use cached value between checks
+            account_mm_rate = self._cached_mm_rate
 
         # Check Account Maintenance Margin Rate (for hedged positions)
         # This is the CORRECT way to check liquidation risk for LONG+SHORT strategy
@@ -1133,10 +1391,10 @@ class GridStrategy:
                     )
                     self._last_warning_time['mm_rate'] = current_time
 
-            # Emergency close if >= 90%
-            if account_mm_rate >= 90.0:
+            # Emergency close if >= threshold (use instance variable set in __init__)
+            if account_mm_rate >= self.mm_rate_threshold:
                 self.logger.error(
-                    f"💥 CRITICAL: Account MM Rate {account_mm_rate:.2f}% >= 90%! "
+                    f"💥 CRITICAL: Account MM Rate {account_mm_rate:.2f}% >= {self.mm_rate_threshold}%! "
                     f"EMERGENCY CLOSE ALL POSITIONS!"
                 )
 
@@ -1146,7 +1404,7 @@ class GridStrategy:
                     if total_qty > 0:
                         self._emergency_close(
                             side, current_price,
-                            f"Account MM Rate {account_mm_rate:.2f}% >= 90%"
+                            f"Account MM Rate {account_mm_rate:.2f}% >= {self.mm_rate_threshold}%"
                         )
 
                 # Set emergency stop flag to prevent further operations
@@ -1155,7 +1413,7 @@ class GridStrategy:
                 # Create emergency stop flag file to prevent systemd restart
                 reason = (
                     f"Account Maintenance Margin Rate {account_mm_rate:.2f}% "
-                    f"reached critical level (>= 90%). All positions closed. "
+                    f"reached critical level (>= {self.mm_rate_threshold}%). All positions closed. "
                     f"Review account and fix issues before restarting."
                 )
                 self._create_emergency_stop_flag(reason)
@@ -1163,8 +1421,8 @@ class GridStrategy:
                 # STOP BOT - this is critical!
                 raise RuntimeError(f"[{self.symbol}] {reason}")
 
-        # Balance check is now performed in _execute_grid_order() using totalAvailableBalance from exchange
-        # This is simpler and more accurate than calculating exposure manually
+        # Available balance is checked in _execute_grid_order() before averaging
+        # (balance changes only on execution events, not price ticks)
         return True
 
     def _emergency_close(self, side: str, current_price: float, reason: str):
@@ -1192,7 +1450,8 @@ class GridStrategy:
                 price=current_price,
                 qty=total_qty,
                 reason=f"EMERGENCY: {reason}",
-                dry_run=self.dry_run
+                dry_run=self.dry_run,
+                account_prefix=f"{self.id_str}_"
             )
 
             # Log to metrics tracker

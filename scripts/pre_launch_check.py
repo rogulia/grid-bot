@@ -102,13 +102,11 @@ def main():
 
         # Check 4: Risk Management
         print_section("4️⃣  RISK MANAGEMENT")
-        max_exposure = risk_config.get('max_total_exposure')
-        liq_buffer = risk_config.get('liquidation_buffer')
-        stop_loss = risk_config.get('emergency_stop_loss')
+        mm_rate_threshold = risk_config.get('mm_rate_threshold', 90.0)
 
-        print(f"  Max Exposure:        ${max_exposure:.2f}")
-        print(f"  Liquidation Buffer:  {liq_buffer}%")
-        print(f"  Emergency Stop:      ${stop_loss:.2f}")
+        print(f"  MM Rate Threshold:   {mm_rate_threshold}% (emergency close when Account MM >= this)")
+        print(f"  ⚠️  Note: Old risk parameters (max_total_exposure, liquidation_buffer, emergency_stop_loss) are DEPRECATED")
+        print(f"      Bot now uses Account MM Rate from Bybit for liquidation protection")
 
         # Check 5: Current Price
         print_section("5️⃣  MARKET DATA")

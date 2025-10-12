@@ -29,8 +29,25 @@ except ImportError:
     print("   Install with: pip install pandas matplotlib")
 
 
-def load_performance_metrics(file_path="data/performance_metrics.csv"):
-    """Load performance metrics CSV"""
+def load_performance_metrics(account_id="001", date=None):
+    """
+    Load performance metrics CSV
+
+    Args:
+        account_id: Account ID (default: "001")
+        date: Specific date in YYYY-MM-DD format. If None, uses today's date.
+
+    Returns:
+        DataFrame with metrics or None if file not found
+    """
+    if date is None:
+        # Use today's date in Helsinki timezone
+        from datetime import datetime
+        import pytz
+        date = datetime.now(pytz.timezone('Europe/Helsinki')).strftime("%Y-%m-%d")
+
+    file_path = f"data/{account_id}_performance_metrics_{date}.csv"
+
     if not Path(file_path).exists():
         print(f"❌ File not found: {file_path}")
         return None
@@ -40,8 +57,25 @@ def load_performance_metrics(file_path="data/performance_metrics.csv"):
     return df
 
 
-def load_trades_history(file_path="data/trades_history.csv"):
-    """Load trades history CSV"""
+def load_trades_history(account_id="001", date=None):
+    """
+    Load trades history CSV
+
+    Args:
+        account_id: Account ID (default: "001")
+        date: Specific date in YYYY-MM-DD format. If None, uses today's date.
+
+    Returns:
+        DataFrame with trades or None if file not found
+    """
+    if date is None:
+        # Use today's date in Helsinki timezone
+        from datetime import datetime
+        import pytz
+        date = datetime.now(pytz.timezone('Europe/Helsinki')).strftime("%Y-%m-%d")
+
+    file_path = f"data/{account_id}_trades_history_{date}.csv"
+
     if not Path(file_path).exists():
         print(f"❌ File not found: {file_path}")
         return None

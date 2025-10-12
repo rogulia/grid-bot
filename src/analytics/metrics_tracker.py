@@ -84,29 +84,36 @@ class MetricsTracker:
         self.logger.info(f"MetricsTracker initialized with balance: ${initial_balance:.2f}{prefix_info}")
 
     def _init_csv_files(self):
-        """Initialize CSV files with headers"""
-        # Performance metrics CSV (with prefix for backtesting)
-        metrics_filename = f"{self.file_prefix}performance_metrics.csv"
-        self.metrics_file = self.data_dir / metrics_filename
-        if not self.metrics_file.exists():
-            with open(self.metrics_file, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    'timestamp', 'symbol', 'price', 'long_positions', 'short_positions',
-                    'long_qty', 'short_qty', 'long_pnl', 'short_pnl',
-                    'total_pnl', 'total_trades', 'balance'
-                ])
+        """Initialize CSV files - no longer needed, files created dynamically with dates"""
+        # CSV files now include date suffix and are created on-demand
+        pass
 
-        # Trades history CSV (with prefix for backtesting)
-        trades_filename = f"{self.file_prefix}trades_history.csv"
-        self.trades_file = self.data_dir / trades_filename
-        if not self.trades_file.exists():
-            with open(self.trades_file, 'w', newline='', encoding='utf-8') as f:
+    def _get_csv_filename(self, base_name: str) -> Path:
+        """
+        Get CSV filename with current date suffix
+
+        Args:
+            base_name: Base filename (e.g., 'performance_metrics' or 'trades_history')
+
+        Returns:
+            Full path with format: {prefix}{base_name}_{YYYY-MM-DD}.csv
+        """
+        current_date = now_helsinki().strftime("%Y-%m-%d")
+        filename = f"{self.file_prefix}{base_name}_{current_date}.csv"
+        return self.data_dir / filename
+
+    def _ensure_csv_header(self, file_path: Path, headers: list):
+        """
+        Create CSV file with headers if it doesn't exist
+
+        Args:
+            file_path: Path to CSV file
+            headers: List of column headers
+        """
+        if not file_path.exists():
+            with open(file_path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow([
-                    'timestamp', 'symbol', 'side', 'action', 'price', 'quantity',
-                    'reason', 'pnl', 'open_fee', 'close_fee', 'funding_fee'
-                ])
+                writer.writerow(headers)
 
     def log_trade(
         self,
@@ -119,7 +126,8 @@ class MetricsTracker:
         pnl: Optional[float] = None,
         open_fee: float = 0.0,
         close_fee: float = 0.0,
-        funding_fee: float = 0.0
+        funding_fee: float = 0.0,
+        timestamp: Optional[str] = None
     ):
         """
         Log a trade
@@ -135,9 +143,10 @@ class MetricsTracker:
             open_fee: Fee paid to open position (default: 0.0)
             close_fee: Fee paid to close position (default: 0.0)
             funding_fee: Accumulated funding fees (default: 0.0)
+            timestamp: Trade timestamp from exchange (optional, defaults to current time)
         """
         trade = TradeMetric(
-            timestamp=format_helsinki(),
+            timestamp=timestamp if timestamp else format_helsinki(),
             symbol=symbol,
             side=side,
             action=action,
@@ -171,8 +180,14 @@ class MetricsTracker:
             if drawdown > self.max_drawdown:
                 self.max_drawdown = drawdown
 
-        # Write to CSV
-        with open(self.trades_file, 'a', newline='', encoding='utf-8') as f:
+        # Write to CSV (with date suffix)
+        trades_file = self._get_csv_filename('trades_history')
+        self._ensure_csv_header(trades_file, [
+            'timestamp', 'symbol', 'side', 'action', 'price', 'quantity',
+            'reason', 'pnl', 'open_fee', 'close_fee', 'funding_fee'
+        ])
+
+        with open(trades_file, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
                 trade.timestamp, trade.symbol, trade.side, trade.action, trade.price,
@@ -226,8 +241,15 @@ class MetricsTracker:
         self.snapshots.append(snapshot)
         self.total_pnl = total_pnl
 
-        # Write to CSV
-        with open(self.metrics_file, 'a', newline='', encoding='utf-8') as f:
+        # Write to CSV (with date suffix)
+        metrics_file = self._get_csv_filename('performance_metrics')
+        self._ensure_csv_header(metrics_file, [
+            'timestamp', 'symbol', 'price', 'long_positions', 'short_positions',
+            'long_qty', 'short_qty', 'long_pnl', 'short_pnl',
+            'total_pnl', 'total_trades', 'balance'
+        ])
+
+        with open(metrics_file, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
                 snapshot.timestamp, snapshot.symbol, snapshot.price, snapshot.long_positions,
@@ -236,14 +258,18 @@ class MetricsTracker:
                 snapshot.total_trades, snapshot.balance
             ])
 
-    def generate_summary_report(self) -> Dict:
+    def generate_summary_report(self, end_time=None) -> Dict:
         """
         Generate summary report
+
+        Args:
+            end_time: Optional end time for the report (default: current time)
 
         Returns:
             Dictionary with summary statistics
         """
-        end_time = now_helsinki()
+        if end_time is None:
+            end_time = now_helsinki()
         duration = (end_time - self.start_time).total_seconds() / 3600  # hours
 
         # Calculate statistics
@@ -296,21 +322,18 @@ class MetricsTracker:
 
         return summary
 
-    def save_summary_report(self, date_suffix: str = None):
+    def save_summary_report(self, date_suffix: str, end_time=None):
         """
-        Save summary report to files
+        Save summary report to files (daily reports only)
 
         Args:
-            date_suffix: Optional date suffix for filename (e.g., '2025-10-10').
-                        If None, uses default 'summary_report' name.
+            date_suffix: REQUIRED date suffix for filename (e.g., '2025-10-10')
+            end_time: Optional end time for the report (default: current time)
         """
-        summary = self.generate_summary_report()
+        summary = self.generate_summary_report(end_time=end_time)
 
-        # Build filename with optional date suffix
-        if date_suffix:
-            base_name = f"summary_report_{date_suffix}"
-        else:
-            base_name = "summary_report"
+        # Build filename with date suffix (REQUIRED - no session reports!)
+        base_name = f"summary_report_{date_suffix}"
 
         # Save JSON (with prefix for backtesting)
         json_filename = f"{self.file_prefix}{base_name}.json"
@@ -365,3 +388,108 @@ class MetricsTracker:
         self.logger.info(f"Summary report saved to {json_file} and {txt_file}")
 
         return summary
+
+    def generate_daily_report(self, date: str):
+        """
+        Generate daily report for specific date
+
+        Args:
+            date: Date in format YYYY-MM-DD (e.g., '2025-10-11')
+
+        Returns:
+            Summary dict if report was generated, None if no data for this date
+        """
+        # Check if trades CSV file exists (with date suffix)
+        trades_csv = self.data_dir / f"{self.file_prefix}trades_history_{date}.csv"
+        if not trades_csv.exists():
+            self.logger.info(f"No trades history file found for daily report {date}")
+            return None
+
+        # Read trades from CSV
+        try:
+            with open(trades_csv, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                all_trades = list(reader)
+        except Exception as e:
+            self.logger.error(f"Failed to read trades CSV for daily report: {e}")
+            return None
+
+        # Filter trades by date (timestamp format: "2025-10-11 13:39:19")
+        daily_trades = [t for t in all_trades if t['timestamp'].startswith(date)]
+
+        if not daily_trades:
+            self.logger.info(f"No trades found for date {date}, skipping daily report")
+            return None
+
+        self.logger.info(f"📊 Generating daily report for {date} ({len(daily_trades)} trades)")
+
+        # Calculate daily statistics
+        closing_trades = [t for t in daily_trades if t['action'] == 'CLOSE' and t.get('pnl')]
+
+        if not closing_trades:
+            self.logger.info(f"No closed trades for {date}, skipping report")
+            return None
+
+        # Calculate PnL
+        realized_pnl = sum(float(t['pnl']) for t in closing_trades if t.get('pnl'))
+        total_fees = sum(
+            float(t.get('open_fee', 0)) + float(t.get('close_fee', 0)) + float(t.get('funding_fee', 0))
+            for t in closing_trades
+        )
+
+        # Win/loss stats
+        winning = [t for t in closing_trades if float(t.get('pnl', 0)) > 0]
+        losing = [t for t in closing_trades if float(t.get('pnl', 0)) < 0]
+        win_rate = (len(winning) / len(closing_trades) * 100) if closing_trades else 0
+
+        # Best/worst trades
+        pnls = [float(t['pnl']) for t in closing_trades]
+        best_trade = max(pnls) if pnls else 0
+        worst_trade = min(pnls) if pnls else 0
+        avg_trade = realized_pnl / len(closing_trades) if closing_trades else 0
+
+        # Store original tracker state
+        original_start = self.start_time
+        original_realized = self.realized_pnl
+        original_winning = self.winning_trades
+        original_losing = self.losing_trades
+        original_total = self.total_trades
+        original_pnl = self.total_pnl
+
+        # Temporarily set daily values
+        # Create timezone-aware datetime for Helsinki
+        import pytz
+        helsinki_tz = pytz.timezone('Europe/Helsinki')
+
+        # Start time: 00:00:00
+        naive_start = datetime.strptime(f"{date} 00:00:00", "%Y-%m-%d %H:%M:%S")
+        self.start_time = helsinki_tz.localize(naive_start)
+
+        # End time: 23:59:59
+        naive_end = datetime.strptime(f"{date} 23:59:59", "%Y-%m-%d %H:%M:%S")
+        end_time = helsinki_tz.localize(naive_end)
+
+        self.realized_pnl = realized_pnl
+        self.winning_trades = len(winning)
+        self.losing_trades = len(losing)
+        self.total_trades = len(daily_trades)
+        self.total_pnl = realized_pnl
+
+        try:
+            # Generate and save report with date suffix and end time
+            summary = self.save_summary_report(date_suffix=date, end_time=end_time)
+
+            self.logger.info(
+                f"✅ Daily report for {date}: "
+                f"PnL=${realized_pnl:.2f}, Trades={len(closing_trades)}, Win Rate={win_rate:.1f}%"
+            )
+
+            return summary
+        finally:
+            # Restore original tracker state
+            self.start_time = original_start
+            self.realized_pnl = original_realized
+            self.winning_trades = original_winning
+            self.losing_trades = original_losing
+            self.total_trades = original_total
+            self.total_pnl = original_pnl
