@@ -16,6 +16,7 @@ from src.core.multi_account_bot import MultiAccountBot
 from src.core.trading_account import TradingAccount
 from src.utils.timezone import now_helsinki
 from src.utils.logger import HelsinkiFormatter
+from src.utils.emergency_stop_manager import EmergencyStopManager
 
 
 class MultiAccountOrchestrator:
@@ -72,7 +73,7 @@ class MultiAccountOrchestrator:
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
 
-        # Console handler (for systemd/screen)
+        # Console handler (for systemd/screen) - uses same formatter with Helsinki timezone
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
@@ -155,17 +156,10 @@ class MultiAccountOrchestrator:
             emergency_accounts = []
             for acc_config in accounts_config:
                 account_id = acc_config['id']
-                id_str = f"{account_id:03d}"
-                emergency_file = Path(f"data/.{id_str}_emergency_stop")
-
-                if emergency_file.exists():
-                    try:
-                        with open(emergency_file) as f:
-                            data = json.load(f)
-                        emergency_accounts.append((id_str, acc_config['name'], data))
-                    except Exception as e:
-                        self.logger.error(f"❌ Failed to read emergency stop file {emergency_file}: {e}")
-                        emergency_accounts.append((id_str, acc_config['name'], {'reason': 'unknown', 'timestamp': 'unknown'}))
+                if EmergencyStopManager.exists(account_id):
+                    id_str = f"{account_id:03d}"
+                    data = EmergencyStopManager.get_data(account_id) or {}
+                    emergency_accounts.append((id_str, acc_config['name'], data))
 
             if emergency_accounts:
                 self.logger.error("=" * 80)
@@ -173,8 +167,9 @@ class MultiAccountOrchestrator:
                 self.logger.error("=" * 80)
 
                 for id_str, name, data in emergency_accounts:
+                    file_path = EmergencyStopManager.get_file_path(int(id_str))
                     self.logger.error(f"\nAccount {id_str}: {name}")
-                    self.logger.error(f"  File: data/.{id_str}_emergency_stop")
+                    self.logger.error(f"  File: {file_path}")
                     self.logger.error(f"  Timestamp: {data.get('timestamp', 'unknown')}")
                     self.logger.error(f"  Reason: {data.get('reason', 'unknown')}")
                     self.logger.error(f"  Symbol: {data.get('symbol', 'N/A')}")
@@ -182,7 +177,8 @@ class MultiAccountOrchestrator:
                 self.logger.error("\n" + "=" * 80)
                 self.logger.error("⚠️  Fix issues and remove emergency stop files:")
                 for id_str, _, _ in emergency_accounts:
-                    self.logger.error(f"   rm data/.{id_str}_emergency_stop")
+                    file_path = EmergencyStopManager.get_file_path(int(id_str))
+                    self.logger.error(f"   rm {file_path}")
                 self.logger.error("=" * 80)
 
                 raise RuntimeError(

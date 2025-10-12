@@ -10,12 +10,14 @@ from datetime import datetime
 
 from ..exchange.bybit_client import BybitClient
 from ..exchange.bybit_private_ws import BybitPrivateWebSocket
+from ..exchange.bybit_websocket import BybitWebSocket
 from ..strategy.position_manager import PositionManager
 from ..strategy.grid_strategy import GridStrategy
 from ..analytics.metrics_tracker import MetricsTracker
 from .state_manager import StateManager
 from ..utils.timezone import now_helsinki
 from ..utils.logger import HelsinkiFormatter
+from ..utils.emergency_stop_manager import EmergencyStopManager
 
 
 class TradingAccount:
@@ -77,6 +79,9 @@ class TradingAccount:
         # Private WebSocket for execution stream (initialized in initialize())
         self.private_ws: Optional[BybitPrivateWebSocket] = None
 
+        # Position WebSocket for real-time position updates (per symbol, initialized in initialize())
+        self.position_websockets: Dict[str, BybitWebSocket] = {}
+
         # Strategy components (per symbol)
         self.strategies: Dict[str, GridStrategy] = {}
         self.position_managers: Dict[str, PositionManager] = {}
@@ -91,6 +96,9 @@ class TradingAccount:
 
         # Last log times for periodic logging
         self.last_log_times: Dict[str, float] = {}
+
+        # Initial sync flags (per symbol) - sync on first price update from WebSocket
+        self._initial_sync_done: Dict[str, bool] = {}
 
     def _setup_logging(self):
         """
@@ -124,10 +132,11 @@ class TradingAccount:
         bot_file_handler.setFormatter(formatter)
         self.logger.addHandler(bot_file_handler)
 
-        # Console handler (for systemd/screen output)
+        # Console handler (for systemd/screen output) - with Helsinki timezone
         console_handler = logging.StreamHandler()
-        console_formatter = logging.Formatter(
-            f'[{self.id_str}] %(levelname)s - %(message)s'
+        console_formatter = HelsinkiFormatter(
+            f'%(asctime)s [{self.id_str}] %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
         )
         console_handler.setFormatter(console_formatter)
         self.logger.addHandler(console_handler)
@@ -168,39 +177,26 @@ class TradingAccount:
         self.logger.info("=" * 60)
 
         # ⚠️ CRITICAL: Check for emergency stop file
-        emergency_file = Path(f"data/.{self.id_str}_emergency_stop")
-        if emergency_file.exists():
-            try:
-                with open(emergency_file) as f:
-                    data = json.load(f)
+        EmergencyStopManager.validate_and_raise(
+            account_id=self.account_id,
+            account_name=self.name
+        )
 
-                raise RuntimeError(
-                    f"❌ Account {self.id_str} ({self.name}) has emergency stop flag!\n"
-                    f"   File: {emergency_file}\n"
-                    f"   Timestamp: {data.get('timestamp', 'unknown')}\n"
-                    f"   Reason: {data.get('reason', 'unknown')}\n"
-                    f"   Symbol: {data.get('symbol', 'N/A')}\n"
-                    f"\n"
-                    f"   Fix issues and remove file:\n"
-                    f"   rm {emergency_file}"
-                )
-            except json.JSONDecodeError:
-                raise RuntimeError(
-                    f"❌ Account {self.id_str} has corrupted emergency stop file: {emergency_file}\n"
-                    f"   Remove it manually: rm {emergency_file}"
-                )
+        # Create balance manager (shared across all strategies for this account)
+        from ..utils.balance_manager import BalanceManager
+        self.balance_manager = BalanceManager(self.client)
 
-        # Get account balance (REQUIRED - fail-fast if not available)
+        # Get account balance via balance_manager (REQUIRED - fail-fast if not available)
         self.logger.info("Fetching account balance...")
-        balance_data = self.client.get_wallet_balance()
+        balance_data = self.balance_manager.get_full_balance_data(force_refresh=True)
         if not balance_data:
             raise RuntimeError(f"[{self.id_str}] Failed to get wallet balance from exchange")
 
-        accounts = balance_data.get('list', [])
-        if not accounts or 'totalEquity' not in accounts[0]:
+        # Get totalEquity for metrics tracker (fallback to totalAvailableBalance if needed)
+        initial_balance = float(balance_data.get('totalEquity', balance_data.get('totalAvailableBalance', 0)))
+        if initial_balance == 0:
             raise RuntimeError(f"[{self.id_str}] Invalid balance response from exchange")
 
-        initial_balance = float(accounts[0]['totalEquity'])
         self.logger.info(f"💰 Account Balance: ${initial_balance:.2f}")
 
         # Initialize metrics tracker with account ID prefix
@@ -248,27 +244,87 @@ class TradingAccount:
             # Merge strategy config with risk config
             combined_config = {**strategy_config, **self.risk_config}
 
-            # Create grid strategy (pass account_id and logger!)
+            # Create grid strategy (pass account_id, logger, and balance_manager!)
             self.strategies[symbol] = GridStrategy(
                 client=self.client,
                 position_manager=self.position_managers[symbol],
                 config=combined_config,
                 dry_run=self.dry_run,
                 metrics_tracker=self.metrics_tracker,
-                account_id=self.account_id,      # ✅ Pass ID
-                account_logger=self.logger        # ✅ Pass logger
+                account_id=self.account_id,          # ✅ Pass ID
+                account_logger=self.logger,          # ✅ Pass logger
+                balance_manager=self.balance_manager  # ✅ Pass shared balance manager
             )
 
-            # Get initial price
-            ticker = self.client.get_ticker(symbol, category)
-            if not ticker:
-                raise RuntimeError(f"[{self.id_str}] Failed to get ticker for {symbol}")
+            # Mark that initial sync hasn't happened yet (will be done on first price update from WebSocket)
+            self._initial_sync_done[symbol] = False
+            self.logger.info(f"⏳ [{symbol}] Waiting for first price from WebSocket to perform initial sync...")
 
-            initial_price = float(ticker['lastPrice'])
-            self.logger.info(f"💵 [{symbol}] Initial price: ${initial_price:.4f}")
+            # Create Position WebSocket for real-time position updates
+            if not self.dry_run:
+                try:
+                    self.logger.info(f"🔐 [{symbol}] Starting Position WebSocket...")
 
-            # Sync with exchange (opens initial positions if needed)
-            self.strategies[symbol].sync_with_exchange(initial_price)
+                    # Create position callback that routes to strategy
+                    def position_callback(position_data: dict):
+                        """Route position update to strategy"""
+                        try:
+                            self.strategies[symbol].on_position_update(position_data)
+                        except Exception as e:
+                            self.logger.error(
+                                f"[{symbol}] Error in position callback: {e}",
+                                exc_info=True
+                            )
+
+                    # Create wallet callback that routes to strategy
+                    def wallet_callback(wallet_data: dict):
+                        """Route wallet update to strategy"""
+                        try:
+                            self.strategies[symbol].on_wallet_update(wallet_data)
+                        except Exception as e:
+                            self.logger.error(
+                                f"[{symbol}] Error in wallet callback: {e}",
+                                exc_info=True
+                            )
+
+                    # Create order callback that routes to strategy
+                    def order_callback(order_data: dict):
+                        """Route order update to strategy"""
+                        try:
+                            self.strategies[symbol].on_order_update(order_data)
+                        except Exception as e:
+                            self.logger.error(
+                                f"[{symbol}] Error in order callback: {e}",
+                                exc_info=True
+                            )
+
+                    # Create WebSocket with credentials and all callbacks
+                    position_ws = BybitWebSocket(
+                        symbol=symbol,
+                        price_callback=lambda price: None,  # Not using price from this WS (using shared WS)
+                        demo=self.demo,
+                        channel_type="linear",
+                        api_key=self.api_key,
+                        api_secret=self.api_secret,
+                        position_callback=position_callback,
+                        wallet_callback=wallet_callback,
+                        order_callback=order_callback
+                    )
+                    position_ws.start()
+
+                    self.position_websockets[symbol] = position_ws
+                    self.logger.info(f"✅ [{symbol}] Position WebSocket started")
+
+                except Exception as e:
+                    self.logger.error(
+                        f"❌ [{symbol}] Failed to start Position WebSocket: {e}",
+                        exc_info=True
+                    )
+                    raise RuntimeError(
+                        f"[{symbol}] Cannot start without Position WebSocket"
+                    ) from e
+            else:
+                self.logger.info(f"🔕 [{symbol}] Dry run mode - Position WebSocket disabled")
 
             # Initialize last log time
             self.last_log_times[symbol] = 0
@@ -373,6 +429,14 @@ class TradingAccount:
                 # Don't spam logs - emergency already logged
                 return
 
+            # Perform initial sync on first price update from WebSocket
+            if not self._initial_sync_done.get(symbol, True):
+                self.logger.info(f"💵 [{symbol}] First price from WebSocket: ${price:.4f}")
+                self.logger.info(f"🔄 [{symbol}] Performing initial sync with exchange...")
+                strategy.sync_with_exchange(price)
+                self._initial_sync_done[symbol] = True
+                self.logger.info(f"✅ [{symbol}] Initial sync completed")
+
             # Execute strategy logic
             strategy.on_price_update(price)
 
@@ -445,47 +509,16 @@ class TradingAccount:
         return None
 
     async def shutdown(self):
-        """Graceful shutdown of account"""
+        """
+        Graceful shutdown of account
+
+        NOTE: No final state logging here - snapshots are logged every 60 seconds automatically.
+        Daily reports are generated separately via generate_daily_report().
+        Shutdown only stops WebSocket connections.
+        """
         self.logger.info("=" * 60)
         self.logger.info(f"🛑 Shutting down account {self.id_str}: {self.name}")
         self.logger.info("=" * 60)
-
-        # Log final state for each symbol
-        for symbol, strategy in self.strategies.items():
-            position_manager = self.position_managers[symbol]
-
-            # Get current price from WebSocket or client
-            try:
-                ticker = self.client.get_ticker(symbol, strategy.category)
-                current_price = float(ticker['lastPrice']) if ticker else 0
-
-                if current_price > 0:
-                    long_pnl = position_manager.calculate_pnl(current_price, 'Buy')
-                    short_pnl = position_manager.calculate_pnl(current_price, 'Sell')
-                    total_pnl = long_pnl + short_pnl
-
-                    self.logger.info(f"📊 FINAL STATE - {symbol}")
-                    self.logger.info(f"   Price: ${current_price:.4f}")
-                    self.logger.info(f"   LONG Positions: {len(position_manager.long_positions)}")
-                    self.logger.info(f"   SHORT Positions: {len(position_manager.short_positions)}")
-                    self.logger.info(f"   LONG PnL: ${long_pnl:.2f}")
-                    self.logger.info(f"   SHORT PnL: ${short_pnl:.2f}")
-                    self.logger.info(f"   TOTAL PnL: ${total_pnl:.2f}")
-
-                    # Log final snapshot
-                    if self.metrics_tracker:
-                        self.metrics_tracker.log_snapshot(
-                            symbol=symbol,
-                            price=current_price,
-                            long_positions=len(position_manager.long_positions),
-                            short_positions=len(position_manager.short_positions),
-                            long_qty=position_manager.get_total_quantity('Buy'),
-                            short_qty=position_manager.get_total_quantity('Sell'),
-                            long_pnl=long_pnl,
-                            short_pnl=short_pnl
-                        )
-            except Exception as e:
-                self.logger.error(f"[{symbol}] Error getting final state: {e}")
 
         # Stop Private WebSocket
         if self.private_ws:
@@ -495,6 +528,15 @@ class TradingAccount:
                 self.logger.info("✅ Private WebSocket stopped")
             except Exception as e:
                 self.logger.error(f"Error stopping Private WebSocket: {e}")
+
+        # Stop all Position WebSockets
+        for symbol, position_ws in self.position_websockets.items():
+            try:
+                self.logger.info(f"🛑 Stopping Position WebSocket for {symbol}...")
+                position_ws.stop()
+                self.logger.info(f"✅ Position WebSocket for {symbol} stopped")
+            except Exception as e:
+                self.logger.error(f"Error stopping Position WebSocket for {symbol}: {e}")
 
         # Session reports removed - only daily reports are generated (at 00:01)
         self.logger.info("=" * 60)

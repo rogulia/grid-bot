@@ -153,12 +153,3 @@ class StateManager:
         except Exception as e:
             self.logger.error(f"Failed to load state: {e}")
             return None
-
-    def clear_state(self):
-        """Remove state file"""
-        try:
-            if self.state_file.exists():
-                self.state_file.unlink()
-                self.logger.info("State cleared")
-        except Exception as e:
-            self.logger.error(f"Failed to clear state: {e}")

@@ -1,6 +1,7 @@
 """Position manager for tracking LONG and SHORT positions"""
 
 import logging
+import threading
 from dataclasses import dataclass
 from typing import List, Optional, Dict
 from datetime import datetime
@@ -62,6 +63,9 @@ class PositionManager:
         self.leverage = leverage
         self.symbol = symbol
 
+        # Thread safety lock (WebSocket callbacks run in separate threads)
+        self._lock = threading.Lock()
+
         self.long_positions: List[Position] = []
         self.short_positions: List[Position] = []
 
@@ -109,22 +113,23 @@ class PositionManager:
             grid_level=grid_level
         )
 
-        if side == 'Buy':
-            self.long_positions.append(position)
-            self.last_long_entry = entry_price
-            self.logger.info(
-                f"Added LONG position: {quantity} @ ${entry_price:.4f} "
-                f"(grid level {grid_level})"
-            )
-        else:
-            self.short_positions.append(position)
-            self.last_short_entry = entry_price
-            self.logger.info(
-                f"Added SHORT position: {quantity} @ ${entry_price:.4f} "
-                f"(grid level {grid_level})"
-            )
+        with self._lock:
+            if side == 'Buy':
+                self.long_positions.append(position)
+                self.last_long_entry = entry_price
+                self.logger.info(
+                    f"Added LONG position: {quantity} @ ${entry_price:.4f} "
+                    f"(grid level {grid_level})"
+                )
+            else:
+                self.short_positions.append(position)
+                self.last_short_entry = entry_price
+                self.logger.info(
+                    f"Added SHORT position: {quantity} @ ${entry_price:.4f} "
+                    f"(grid level {grid_level})"
+                )
 
-        # Save state after adding position
+        # Save state after adding position (outside lock to avoid deadlock)
         self._save_state()
 
     def remove_all_positions(self, side: str):
@@ -134,18 +139,19 @@ class PositionManager:
         Args:
             side: 'Buy' (LONG) or 'Sell' (SHORT)
         """
-        if side == 'Buy':
-            count = len(self.long_positions)
-            self.long_positions = []
-            self.last_long_entry = None
-            self.logger.info(f"Closed all {count} LONG positions")
-        else:
-            count = len(self.short_positions)
-            self.short_positions = []
-            self.last_short_entry = None
-            self.logger.info(f"Closed all {count} SHORT positions")
+        with self._lock:
+            if side == 'Buy':
+                count = len(self.long_positions)
+                self.long_positions = []
+                self.last_long_entry = None
+                self.logger.info(f"Closed all {count} LONG positions")
+            else:
+                count = len(self.short_positions)
+                self.short_positions = []
+                self.last_short_entry = None
+                self.logger.info(f"Closed all {count} SHORT positions")
 
-        # Save state after removing positions
+        # Save state after removing positions (outside lock to avoid deadlock)
         self._save_state()
 
     def get_average_entry_price(self, side: str) -> Optional[float]:
@@ -158,15 +164,16 @@ class PositionManager:
         Returns:
             Average entry price or None if no positions
         """
-        positions = self.long_positions if side == 'Buy' else self.short_positions
+        with self._lock:
+            positions = self.long_positions if side == 'Buy' else self.short_positions
 
-        if not positions:
-            return None
+            if not positions:
+                return None
 
-        total_quantity = sum(p.quantity for p in positions)
-        weighted_sum = sum(p.entry_price * p.quantity for p in positions)
+            total_quantity = sum(p.quantity for p in positions)
+            weighted_sum = sum(p.entry_price * p.quantity for p in positions)
 
-        return weighted_sum / total_quantity if total_quantity > 0 else None
+            return weighted_sum / total_quantity if total_quantity > 0 else None
 
     def get_total_quantity(self, side: str) -> float:
         """
@@ -178,12 +185,13 @@ class PositionManager:
         Returns:
             Total quantity (rounded to avoid floating point errors)
         """
-        positions = self.long_positions if side == 'Buy' else self.short_positions
-        total = sum(p.quantity for p in positions)
+        with self._lock:
+            positions = self.long_positions if side == 'Buy' else self.short_positions
+            total = sum(p.quantity for p in positions)
 
-        # Round to 8 decimal places to avoid floating point errors like 2.4000000000000004
-        # For crypto, 8 decimals is standard precision
-        return round(total, 8)
+            # Round to 8 decimal places to avoid floating point errors like 2.4000000000000004
+            # For crypto, 8 decimals is standard precision
+            return round(total, 8)
 
     def calculate_pnl(self, current_price: float, side: Optional[str] = None) -> float:
         """
@@ -196,17 +204,18 @@ class PositionManager:
         Returns:
             Total unrealized PnL
         """
-        total_pnl = 0.0
+        with self._lock:
+            total_pnl = 0.0
 
-        if side is None or side == 'Buy':
-            for pos in self.long_positions:
-                total_pnl += pos.get_pnl(current_price, self.leverage)
+            if side is None or side == 'Buy':
+                for pos in self.long_positions:
+                    total_pnl += pos.get_pnl(current_price, self.leverage)
 
-        if side is None or side == 'Sell':
-            for pos in self.short_positions:
-                total_pnl += pos.get_pnl(current_price, self.leverage)
+            if side is None or side == 'Sell':
+                for pos in self.short_positions:
+                    total_pnl += pos.get_pnl(current_price, self.leverage)
 
-        return total_pnl
+            return total_pnl
 
     def get_position_count(self, side: str) -> int:
         """
@@ -218,7 +227,8 @@ class PositionManager:
         Returns:
             Number of positions
         """
-        return len(self.long_positions) if side == 'Buy' else len(self.short_positions)
+        with self._lock:
+            return len(self.long_positions) if side == 'Buy' else len(self.short_positions)
 
     # NOTE: get_liquidation_distance() and is_near_liquidation() methods removed.
     # For hedged positions (LONG+SHORT), individual position liqPrice is meaningless.
@@ -253,76 +263,17 @@ class PositionManager:
         """
         return self.long_tp_order_id if side == 'Buy' else self.short_tp_order_id
 
-    def calculate_unrealized_pnl_with_fees(
-        self,
-        current_price: float,
-        side: str,
-        exchange_unrealized_pnl: float,
-        taker_fee_rate: float = 0.0006  # 0.06% default Bybit taker fee
-    ) -> Dict[str, float]:
-        """
-        Calculate unrealized PnL with estimated fees
-
-        This provides a more realistic view of potential profit by accounting for:
-        - Opening fees (already paid)
-        - Closing fees (estimated based on current position value)
-
-        Args:
-            current_price: Current market price
-            side: 'Buy' (LONG) or 'Sell' (SHORT)
-            exchange_unrealized_pnl: Unrealized PnL from exchange API (without fees)
-            taker_fee_rate: Trading fee rate (default 0.06% for Bybit taker)
-
-        Returns:
-            Dictionary with:
-                - base_pnl: Unrealized PnL without fees
-                - estimated_open_fee: Estimated fee paid to open all positions
-                - estimated_close_fee: Estimated fee to close at current price
-                - net_pnl: Net PnL after deducting all fees
-
-        Example:
-            >>> pm = PositionManager(leverage=100)
-            >>> pm.add_position('Buy', 100, 1.0)  # 1 SOL @ $100
-            >>> # Price moved to $105, unrealized = +$5
-            >>> fees = pm.calculate_unrealized_pnl_with_fees(105, 'Buy', 5.0)
-            >>> fees['net_pnl']  # $5 - opening fee - closing fee
-            4.874  # Approximately after ~0.06% fees on both sides
-        """
-        avg_entry = self.get_average_entry_price(side)
-        total_qty = self.get_total_quantity(side)
-
-        if not avg_entry or total_qty == 0:
-            return {
-                'base_pnl': 0.0,
-                'estimated_open_fee': 0.0,
-                'estimated_close_fee': 0.0,
-                'net_pnl': 0.0
-            }
-
-        # Calculate position values
-        entry_position_value = total_qty * avg_entry
-        current_position_value = total_qty * current_price
-
-        # Estimate fees (taker fee on both open and close)
-        estimated_open_fee = entry_position_value * taker_fee_rate
-        estimated_close_fee = current_position_value * taker_fee_rate
-
-        # Net PnL = unrealized PnL - fees
-        net_pnl = exchange_unrealized_pnl - estimated_open_fee - estimated_close_fee
-
-        return {
-            'base_pnl': exchange_unrealized_pnl,
-            'estimated_open_fee': estimated_open_fee,
-            'estimated_close_fee': estimated_close_fee,
-            'net_pnl': net_pnl
-        }
-
     def _save_state(self):
         """Save current state to JSON"""
         if self.state_manager:
+            with self._lock:
+                # Make copies to avoid holding lock during file I/O
+                long_copy = list(self.long_positions)
+                short_copy = list(self.short_positions)
+
             self.state_manager.save_state(
-                long_positions=self.long_positions,
-                short_positions=self.short_positions,
+                long_positions=long_copy,
+                short_positions=short_copy,
                 long_tp_id=self.long_tp_order_id,
                 short_tp_id=self.short_tp_order_id
             )

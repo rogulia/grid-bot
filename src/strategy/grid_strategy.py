@@ -2,10 +2,15 @@
 
 import logging
 import time
+import threading
 from typing import Optional, TYPE_CHECKING
 from .position_manager import PositionManager
 from ..exchange.bybit_client import BybitClient
 from ..utils.logger import log_trade
+from ..utils.balance_manager import BalanceManager
+from ..utils.timestamp_converter import TimestampConverter
+from ..utils.emergency_stop_manager import EmergencyStopManager
+from config.constants import TradingConstants, LogMessages
 
 if TYPE_CHECKING:
     from ..analytics.metrics_tracker import MetricsTracker
@@ -22,7 +27,8 @@ class GridStrategy:
         dry_run: bool = True,
         metrics_tracker: Optional['MetricsTracker'] = None,
         account_id: int = 0,
-        account_logger: Optional[logging.Logger] = None
+        account_logger: Optional[logging.Logger] = None,
+        balance_manager: Optional['BalanceManager'] = None
     ):
         """
         Initialize grid strategy
@@ -35,6 +41,7 @@ class GridStrategy:
             metrics_tracker: Optional metrics tracker for analytics
             account_id: Account ID (for multi-account support)
             account_logger: Logger from TradingAccount (logs to per-account files)
+            balance_manager: Optional shared balance manager (for multi-strategy accounts)
         """
         # Account identification
         self.account_id = account_id
@@ -48,6 +55,16 @@ class GridStrategy:
         self.pm = position_manager
         self.dry_run = dry_run
         self.metrics_tracker = metrics_tracker
+
+        # Balance manager (use shared if provided, otherwise create new)
+        if balance_manager:
+            self.balance_manager = balance_manager
+        else:
+            # Create new balance manager (for tests and standalone use)
+            self.balance_manager = BalanceManager(
+                client,
+                cache_ttl_seconds=TradingConstants.BALANCE_CACHE_TTL_SEC
+            )
 
         # Load config - symbol is REQUIRED (no default!)
         if 'symbol' not in config:
@@ -63,9 +80,6 @@ class GridStrategy:
         self.max_grid_levels = config.get('max_grid_levels_per_side', 10)
 
         # Risk management
-        self.liquidation_buffer = config.get('liquidation_buffer', 0.8)
-        # max_exposure: no limit by default (works with any balance!)
-        self.max_exposure = config.get('max_total_exposure', float('inf'))
         # MM rate threshold for emergency close (configurable per account)
         self.mm_rate_threshold = config.get('mm_rate_threshold', 90.0)
 
@@ -75,19 +89,26 @@ class GridStrategy:
         # Throttling for log messages (to avoid spam)
         # Track last time each warning type was logged
         self._last_warning_time = {
-            'max_exposure': 0,
             'mm_rate': 0,
-            'liquidation': 0
+            'insufficient_balance': 0
         }
-        self._warning_interval = 60  # Log warnings max once per 60 seconds
-
-        # Throttling for MM Rate checks (to avoid API rate limits)
-        self._cached_mm_rate: Optional[float] = None
-        self._last_mm_rate_check_time: float = 0
-        self._mm_rate_check_interval: float = 30.0  # Check every 30 seconds
+        self._warning_interval = TradingConstants.WARNING_LOG_INTERVAL_SEC
 
         # Emergency stop flag - prevents any operations after critical failure
         self.emergency_stopped = False
+
+        # Thread safety locks (WebSocket callbacks run in separate threads)
+        self._tp_orders_lock = threading.Lock()
+        self._pnl_lock = threading.Lock()
+
+        # Track cumulative realized PnL for each side (to calculate delta on position close)
+        self._last_cum_realised_pnl = {'Buy': 0.0, 'Sell': 0.0}
+
+        # Track TP order IDs for each side (updated via Order WebSocket)
+        self._tp_orders = {'Buy': None, 'Sell': None}
+
+        # Track current price from WebSocket (eliminates need for REST get_ticker calls)
+        self.current_price: float = 0.0
 
         self.logger.info(
             f"[{self.symbol}] Grid strategy initialized - Symbol: {self.symbol}, "
@@ -205,6 +226,60 @@ class GridStrategy:
         """
         return qty * price
 
+    def _open_initial_position(self, side: str, current_price: float):
+        """
+        Open initial position for a side
+
+        Args:
+            side: 'Buy' for LONG or 'Sell' for SHORT
+            current_price: Current market price
+
+        Raises:
+            Exception: If order placement fails (in live mode)
+        """
+        initial_qty = self._usd_to_qty(self.initial_size_usd, current_price)
+        self.logger.info(
+            f"🆕 [{self.symbol}] Opening initial {side} position: ${self.initial_size_usd} "
+            f"({initial_qty:.6f} {self.symbol}) @ ${current_price:.4f}"
+        )
+
+        if not self.dry_run:
+            try:
+                response = self.client.place_order(
+                    symbol=self.symbol,
+                    side=side,
+                    qty=initial_qty,
+                    order_type="Market",
+                    category=self.category
+                )
+                self.logger.info(f"[{self.symbol}] Order response: {response}")
+            except Exception as e:
+                self.logger.error(f"[{self.symbol}] Failed to open {side} position: {e}")
+                raise
+
+        # Track position
+        self.pm.add_position(
+            side=side,
+            entry_price=current_price,
+            quantity=initial_qty,
+            grid_level=0
+        )
+
+        # Set TP order
+        self._update_tp_order(side)
+
+        # Log to metrics
+        if self.metrics_tracker:
+            self.metrics_tracker.log_trade(
+                symbol=self.symbol,
+                side=side,
+                action="OPEN",
+                price=current_price,
+                quantity=initial_qty,
+                reason="Initial position",
+                pnl=None
+            )
+
     def is_stopped(self) -> bool:
         """
         Check if strategy is in emergency stop state
@@ -225,172 +300,28 @@ class GridStrategy:
         Args:
             reason: Reason for emergency stop
         """
-        from datetime import datetime
-        from pathlib import Path
-
-        # Per-account emergency stop file: data/.{ID}_emergency_stop
-        flag_file = Path(f"data/.{self.id_str}_emergency_stop")
-        flag_file.parent.mkdir(parents=True, exist_ok=True)
-
-        from ..utils.timezone import now_helsinki
-        flag_content = {
-            "timestamp": now_helsinki().isoformat(),
-            "account_id": self.account_id,
-            "symbol": self.symbol,
-            "reason": reason
-        }
-
-        import json
-        with open(flag_file, 'w') as f:
-            json.dump(flag_content, f, indent=2)
-
-        self.logger.critical(
-            f"🚨 [{self.symbol}] EMERGENCY STOP FLAG CREATED: {flag_file}\n"
-            f"   Account ID: {self.id_str}\n"
-            f"   Reason: {reason}\n"
-            f"   Bot will not restart automatically.\n"
-            f"   Fix issues and remove file: rm {flag_file}"
+        emergency_manager = EmergencyStopManager(logger=self.logger)
+        emergency_manager.create(
+            account_id=self.account_id,
+            symbol=self.symbol,
+            reason=reason
         )
-
-    def _restore_positions_from_order_history(self, side: str, exchange_qty: float, exchange_avg_price: float) -> bool:
-        """
-        Restore position history from exchange order history (PRIMARY method)
-
-        This method reconstructs the position grid levels by analyzing order history:
-        1. Gets recent order history from exchange
-        2. Finds last reduceOnly order (position closure)
-        3. All orders after that = current position orders
-        4. Restores each order as separate position with grid_level
-
-        Args:
-            side: 'Buy' or 'Sell'
-            exchange_qty: Current position quantity from exchange
-            exchange_avg_price: Average entry price from exchange
-
-        Returns:
-            True if successfully restored, False otherwise
-
-        Raises:
-            RuntimeError: If restoration fails (fail-fast principle)
-        """
-        try:
-            # Get order history from exchange
-            order_history = self.client.get_order_history(
-                symbol=self.symbol,
-                category=self.category,
-                limit=50
-            )
-
-            if not order_history:
-                raise RuntimeError(
-                    f"[{self.symbol}] Cannot restore {side} position: order history is empty. "
-                    f"Exchange shows {exchange_qty} position but no order history available."
-                )
-
-            # Filter by position index (1=LONG/Buy, 2=SHORT/Sell)
-            position_idx = 1 if side == 'Buy' else 2
-            relevant_orders = [
-                order for order in order_history
-                if int(order.get('positionIdx', 0)) == position_idx
-                and order.get('orderStatus') == 'Filled'  # Only filled orders
-            ]
-
-            if not relevant_orders:
-                raise RuntimeError(
-                    f"[{self.symbol}] Cannot restore {side} position: no filled orders found "
-                    f"with positionIdx={position_idx}. Exchange shows {exchange_qty} position."
-                )
-
-            # Sort by creation time (oldest first)
-            relevant_orders.sort(key=lambda x: int(x.get('createdTime', 0)))
-
-            # Find last reduceOnly order (position closure)
-            last_reduce_idx = -1
-            for i, order in enumerate(relevant_orders):
-                if order.get('reduceOnly', False):
-                    last_reduce_idx = i
-
-            # Orders after last closure = current position
-            if last_reduce_idx >= 0:
-                # Position was closed and reopened
-                position_orders = relevant_orders[last_reduce_idx + 1:]
-            else:
-                # No closure found - all orders are part of current position
-                position_orders = relevant_orders
-
-            # Filter out reduceOnly orders (we only want position-opening orders)
-            position_orders = [
-                order for order in position_orders
-                if not order.get('reduceOnly', False)
-            ]
-
-            if not position_orders:
-                raise RuntimeError(
-                    f"[{self.symbol}] Cannot restore {side} position: no position-opening orders found "
-                    f"after last closure. Exchange shows {exchange_qty} position."
-                )
-
-            # Restore each order as separate position
-            total_qty = 0.0
-            for grid_level, order in enumerate(position_orders):
-                qty = float(order.get('cumExecQty', 0))  # Executed quantity
-                price = float(order.get('avgPrice', 0))   # Average execution price
-
-                if qty == 0 or price == 0:
-                    self.logger.warning(
-                        f"[{self.symbol}] Skipping order {order.get('orderId')} with qty={qty}, price={price}"
-                    )
-                    continue
-
-                self.pm.add_position(
-                    side=side,
-                    entry_price=price,
-                    quantity=qty,
-                    grid_level=grid_level
-                )
-                total_qty += qty
-
-                self.logger.info(
-                    f"📥 [{self.symbol}] Restored {side} Grid {grid_level}: "
-                    f"{qty} @ ${price:.4f} (order: {order.get('orderId')})"
-                )
-
-            # Validate total quantity matches exchange
-            qty_diff = abs(total_qty - exchange_qty)
-            tolerance = 0.01  # Allow 0.01 difference for rounding
-
-            if qty_diff > tolerance:
-                # Quantity mismatch - this is critical error
-                raise RuntimeError(
-                    f"[{self.symbol}] Position restoration FAILED: quantity mismatch!\n"
-                    f"  Exchange qty: {exchange_qty}\n"
-                    f"  Restored qty: {total_qty}\n"
-                    f"  Difference: {qty_diff}\n"
-                    f"  Orders restored: {len(position_orders)}\n"
-                    f"This indicates data corruption or API inconsistency."
-                )
-
-            self.logger.info(
-                f"✅ [{self.symbol}] Successfully restored {side} position from order history: "
-                f"{len(position_orders)} orders, total {total_qty} @ avg ${exchange_avg_price:.4f}"
-            )
-            return True
-
-        except RuntimeError:
-            # Re-raise RuntimeError as-is (fail-fast)
-            raise
-        except Exception as e:
-            # Unexpected error - also fail fast
-            raise RuntimeError(
-                f"[{self.symbol}] Unexpected error restoring {side} position from order history: {e}"
-            ) from e
 
     def sync_with_exchange(self, current_price: float):
         """
         Sync local position state with exchange reality
-        - Check if positions exist on exchange
-        - If not, open initial position
-        - If yes, update TP order if needed
+
+        **WebSocket-First Architecture:**
+        - Position WebSocket restores positions automatically on connect (snapshot)
+        - Position WebSocket keeps local tracking in sync in real-time (updates)
+        - This method checks if TP orders exist and opens initial positions if needed
+        - No REST API calls for monitoring - all data from WebSocket
+
+        **Position Restoration Flow:**
+        1. Bot starts, Position WebSocket connects
+        2. WebSocket sends snapshot of all open positions
+        3. on_position_update() detects missing local positions and restores them
+        4. State file updates automatically via pm.add_position()
 
         Args:
             current_price: Current market price
@@ -403,204 +334,42 @@ class GridStrategy:
             )
             return
 
-        self.logger.debug(f"🔄 [{self.symbol}] Syncing positions with exchange...")
+        self.logger.debug(LogMessages.SYNC_START.format(symbol=self.symbol))
 
-        # Get available balance for initial position check
+        # Get available balance for initial position check (using BalanceManager)
         available_balance = 0.0
         if not self.dry_run:
             try:
-                balance_info = self.client.get_wallet_balance(account_type="UNIFIED")
-                for account in balance_info.get('list', []):
-                    if account.get('accountType') == 'UNIFIED':
-                        available_balance = float(account.get('totalAvailableBalance', 0))
-                        break
+                available_balance = self.balance_manager.get_available_balance()
             except Exception as e:
                 self.logger.error(f"[{self.symbol}] Failed to get balance: {e}")
 
         for side in ['Buy', 'Sell']:
-            # Check if we have local position tracked
+            # Check if we have local position tracked (updated by Position WebSocket)
             local_qty = self.pm.get_total_quantity(side)
 
-            # Check what's on exchange
-            exchange_pos = self.client.get_active_position(self.symbol, side, self.category)
+            if local_qty > 0:
+                # We have local position tracked by Position WebSocket
+                # Position WebSocket keeps this in sync - no need to check exchange
+                # Only verify TP order exists (tracked by Order WebSocket)
+                with self._tp_orders_lock:
+                    tp_order_id = self._tp_orders.get(side) or self.pm.get_tp_order_id(side)
 
-            if exchange_pos:
-                exchange_qty = float(exchange_pos.get('size', 0))
-                exchange_avg_price = float(exchange_pos.get('avgPrice', current_price))
-
-                if local_qty == 0:
-                    # Exchange has position but we don't track it -> restore from order history
-                    self.logger.info(
-                        f"📥 [{self.symbol}] Restoring {side} position from order history: "
-                        f"{exchange_qty} @ ${exchange_avg_price:.4f}"
+                if not tp_order_id and not self.dry_run:
+                    # TP order missing - create one
+                    self.logger.warning(
+                        f"⚠️  [{self.symbol}] TP order missing for {side} position (qty={local_qty}) - creating new one"
                     )
-
-                    # Restore positions from exchange order history (PRIMARY method - fail-fast!)
-                    self._restore_positions_from_order_history(
-                        side=side,
-                        exchange_qty=exchange_qty,
-                        exchange_avg_price=exchange_avg_price
-                    )
-
-                    # Set TP order
                     self._update_tp_order(side)
                 else:
-                    # Both have position -> verify TP order exists and recover ID if lost
-                    self.logger.debug(f"✅ [{self.symbol}] {side} position already synced")
-
-                    # Check if we lost TP order ID after restart
-                    current_tp_id = self.pm.get_tp_order_id(side)
-                    if not current_tp_id and not self.dry_run:
-                        # Try to recover TP order ID from exchange
-                        try:
-                            open_orders = self.client.get_open_orders(self.symbol, self.category)
-                            position_idx = 1 if side == 'Buy' else 2
-
-                            for order in open_orders:
-                                # Find TP order: reduce-only and correct position index
-                                is_reduce_only = order.get('reduceOnly', False)
-                                order_pos_idx = int(order.get('positionIdx', 0))
-
-                                if is_reduce_only and order_pos_idx == position_idx:
-                                    order_id = order.get('orderId')
-                                    order_price = order.get('price')
-                                    self.logger.info(
-                                        f"♻️  [{self.symbol}] Recovered {side} TP order ID: {order_id} "
-                                        f"@ ${order_price}"
-                                    )
-                                    self.pm.set_tp_order_id(side, order_id)
-                                    break
-                            else:
-                                # No TP order found - create one
-                                self.logger.warning(
-                                    f"⚠️  [{self.symbol}] No TP order found for {side} position - creating new one"
-                                )
-                                self._update_tp_order(side)
-                        except Exception as e:
-                            self.logger.error(
-                                f"[{self.symbol}] Failed to recover TP order ID for {side}: {e}"
-                            )
+                    self.logger.debug(f"✅ [{self.symbol}] {side} position synced (qty={local_qty}, TP order tracked)")
 
             else:
-                # No position on exchange
-                if local_qty > 0:
-                    # Position was closed on exchange (TP execution, liquidation, or manual close)
-                    avg_entry = self.pm.get_average_entry_price(side)
-
-                    self.logger.warning(
-                        f"⚠️  [{self.symbol}] {side} position closed on exchange! "
-                        f"Entry: ${avg_entry:.4f}, Qty: {local_qty}, Current: ${current_price:.4f}"
-                    )
-
-                    # Get REAL PnL from exchange
-                    actual_pnl = None
-                    open_fee = 0.0
-                    close_fee = 0.0
-                    funding_fee = 0.0
-                    close_reason = "Unknown (exchange close)"
-                    close_timestamp = None  # Will be set from Bybit if available
-
-                    if not self.dry_run:
-                        try:
-                            # Wait for exchange to process (increased for reliability)
-                            import time
-                            time.sleep(2)
-
-                            # Get recent closed PnL records (limit=20 to find correct match)
-                            closed_records = self.client.get_closed_pnl(self.symbol, limit=20)
-
-                            record = None
-                            record_index = -1
-                            avg_exit = current_price  # Fallback to WebSocket price
-
-                            if closed_records:
-                                import time as time_module
-                                current_time = time_module.time() * 1000  # milliseconds
-
-                                # Find matching record by side, quantity, and recency
-                                for idx, rec in enumerate(closed_records):
-                                    rec_side = rec.get('side')
-                                    rec_qty = float(rec.get('closedSize', 0))
-                                    rec_time = int(rec.get('updatedTime', 0))
-
-                                    # Check: same side, same qty (with tolerance), within 60 seconds
-                                    time_diff_sec = (current_time - rec_time) / 1000
-
-                                    if (rec_side == side and
-                                        abs(rec_qty - local_qty) < 0.01 and
-                                        time_diff_sec < 60):
-                                        record = rec
-                                        record_index = idx
-                                        break
-
-                                # Fallback to first record if no exact match
-                                if record is None:
-                                    self.logger.warning(
-                                        f"⚠️  [{self.symbol}] No exact match in closed PnL (side={side}, qty={local_qty}), "
-                                        f"using most recent record"
-                                    )
-                                    record = closed_records[0]
-                                    record_index = 0
-
-                            if record:
-                                actual_pnl = float(record.get('closedPnl', 0))
-                                open_fee = float(record.get('openFee', 0))
-                                close_fee = float(record.get('closeFee', 0))
-                                avg_entry = float(record.get('avgEntryPrice', 0))
-                                avg_exit = float(record.get('avgExitPrice', 0))
-
-                                # Extract timestamp from Bybit (updatedTime in milliseconds)
-                                updated_time_ms = int(record.get('updatedTime', 0))
-                                if updated_time_ms > 0:
-                                    # Convert to datetime and format in Helsinki timezone
-                                    from datetime import datetime
-                                    import pytz
-                                    from ..utils.timezone import format_helsinki
-
-                                    utc_dt = datetime.fromtimestamp(updated_time_ms / 1000, tz=pytz.UTC)
-                                    close_timestamp = format_helsinki(utc_dt)
-                                else:
-                                    close_timestamp = None  # Fallback to current time in log_trade
-
-                                # Determine close reason using actual PnL (most reliable)
-                                if actual_pnl > 0:
-                                    price_diff_pct = abs((avg_exit - avg_entry) / avg_entry * 100)
-                                    close_reason = f"Take Profit ({price_diff_pct:.2f}%)"
-                                else:
-                                    close_reason = "Stop-Loss or Liquidation"
-
-                                self.logger.info(
-                                    f"💰 [{self.symbol}] {side} CLOSED ON EXCHANGE (record #{record_index}): "
-                                    f"Entry: ${avg_entry:.4f}, Exit: ${avg_exit:.4f}, "
-                                    f"PnL=${actual_pnl:.4f} ({close_reason}), "
-                                    f"Open Fee=${open_fee:.4f}, Close Fee=${close_fee:.4f}"
-                                )
-                        except Exception as e:
-                            self.logger.error(f"Failed to get closed PnL from exchange: {e}")
-                            raise RuntimeError(
-                                f"[{self.symbol}] Cannot get closed PnL after position close - data integrity compromised"
-                            ) from e
-
-                    # Log the close to metrics
-                    if self.metrics_tracker and actual_pnl is not None:
-                        close_side_name = "Sell" if side == "Buy" else "Buy"
-                        self.metrics_tracker.log_trade(
-                            symbol=self.symbol,
-                            side=close_side_name,
-                            action="CLOSE",
-                            price=avg_exit,  # Use real exit price from Bybit, not WebSocket price
-                            quantity=local_qty,
-                            reason=close_reason,
-                            pnl=actual_pnl,
-                            open_fee=open_fee,
-                            close_fee=close_fee,
-                            funding_fee=funding_fee,
-                            timestamp=close_timestamp  # Use Bybit close time, not detection time
-                        )
-
-                    # NOW remove local tracking
-                    self.pm.remove_all_positions(side)
-                    self.pm.set_tp_order_id(side, None)
+                # No local position tracked
+                # Note: Position WebSocket sends snapshot on connect, so any existing positions
+                # will be restored via on_position_update() callback automatically.
+                # If we reach here, it means no position exists on exchange.
+                # Open initial position:
 
                 # Check balance before opening initial position
                 if not self.dry_run and available_balance < self.initial_size_usd:
@@ -662,23 +431,29 @@ class GridStrategy:
                         pnl=None
                     )
 
-        # Log MM Rate once per sync (every 60s) - critical safety metric
+        # Log MM Rate once per sync (every 60s) - critical safety metric (using BalanceManager)
         if not self.dry_run:
             try:
-                balance_info = self.client.get_wallet_balance(account_type="UNIFIED")
-                for account in balance_info.get('list', []):
-                    if account.get('accountType') == 'UNIFIED':
-                        account_mm_rate_str = account.get('accountMMRate', '')
-                        if account_mm_rate_str:
-                            account_mm_rate = float(account_mm_rate_str) * 100
-                            available_balance = float(account.get('totalAvailableBalance', 0))
-                            self.logger.info(
-                                f"[{self.symbol}] 💎 Balance: ${available_balance:.2f}, "
-                                f"Account MM Rate: {account_mm_rate:.4f}%"
-                            )
-                        break
+                available_balance = self.balance_manager.get_available_balance()
+                account_mm_rate = self.balance_manager.get_mm_rate()
+
+                if account_mm_rate is not None:
+                    self.logger.info(
+                        LogMessages.BALANCE_UPDATE.format(
+                            symbol=self.symbol,
+                            balance=available_balance,
+                            mm_rate=account_mm_rate
+                        )
+                    )
+                else:
+                    self.logger.info(
+                        LogMessages.BALANCE_ONLY.format(
+                            symbol=self.symbol,
+                            balance=available_balance
+                        )
+                    )
             except Exception as e:
-                self.logger.warning(f"[{self.symbol}] Could not log MM Rate: {e}")
+                self.logger.warning(f"[{self.symbol}] Could not log balance/MM Rate: {e}")
 
     def on_execution(self, exec_data: dict):
         """
@@ -736,12 +511,7 @@ class GridStrategy:
             )
 
             # Convert timestamp to Helsinki timezone
-            from datetime import datetime
-            import pytz
-            from ..utils.timezone import format_helsinki
-
-            utc_dt = datetime.fromtimestamp(exec_time_ms / 1000, tz=pytz.UTC)
-            close_timestamp = format_helsinki(utc_dt)
+            close_timestamp = TimestampConverter.exchange_ms_to_helsinki(exec_time_ms)
 
             # Determine which position side was closed
             # Order side 'Sell' closes LONG, 'Buy' closes SHORT
@@ -871,6 +641,48 @@ class GridStrategy:
                 exc_info=True
             )
 
+    def _calculate_honest_tp_price(self, side: str, avg_entry: float) -> float:
+        """
+        Calculate honest TP price that accounts for all fees (opens + averagings + close)
+
+        Formula:
+        - Total fees = (num_positions × taker_fee) + maker_fee
+        - Honest TP percent = tp_percent + total_fees_percent
+
+        Args:
+            side: 'Buy' (LONG) or 'Sell' (SHORT)
+            avg_entry: Average entry price
+
+        Returns:
+            TP price adjusted for fees to achieve true profit target
+        """
+        # Get number of positions (each opened with market order = taker fee)
+        num_positions = self.pm.get_position_count(side)
+
+        # Calculate total fees as percentage
+        # Opens/averages: each position × taker fee (0.055%)
+        # Close: 1 × maker fee (0.020% for limit/TP orders)
+        open_fees_pct = num_positions * TradingConstants.BYBIT_TAKER_FEE_RATE * 100
+        close_fee_pct = TradingConstants.BYBIT_MAKER_FEE_RATE * 100
+        total_fees_pct = open_fees_pct + close_fee_pct
+
+        # Honest TP = user's TP + fees to cover
+        honest_tp_pct = self.tp_pct + total_fees_pct
+
+        # Calculate TP price
+        if side == 'Buy':  # LONG: TP above entry
+            tp_price = avg_entry * (1 + honest_tp_pct / 100)
+        else:  # SHORT: TP below entry
+            tp_price = avg_entry * (1 - honest_tp_pct / 100)
+
+        self.logger.debug(
+            f"[{self.symbol}] Honest TP calc for {side}: "
+            f"positions={num_positions}, fees={total_fees_pct:.3f}%, "
+            f"target={self.tp_pct}%, honest={honest_tp_pct:.3f}%"
+        )
+
+        return tp_price
+
     def _update_tp_order(self, side: str):
         """
         Update Take Profit order for a side (cancel old and place new)
@@ -886,56 +698,34 @@ class GridStrategy:
             self.logger.warning(f"[{self.symbol}] No {side} position to set TP for")
             return
 
-        # Calculate TP price from average entry
-        if side == 'Buy':  # LONG: TP above entry
-            tp_price = avg_entry * (1 + self.tp_pct / 100)
-            tp_side = 'Sell'  # Close with Sell
-        else:  # SHORT: TP below entry
-            tp_price = avg_entry * (1 - self.tp_pct / 100)
-            tp_side = 'Buy'  # Close with Buy
+        # Calculate honest TP price (accounts for all fees)
+        tp_price = self._calculate_honest_tp_price(side, avg_entry)
+        tp_side = 'Sell' if side == 'Buy' else 'Buy'  # Close with opposite side
 
         # Cancel old TP order if exists
+        # Try PositionManager first (fallback for old state files)
         old_tp_id = self.pm.get_tp_order_id(side)
 
+        # If not in PM, check Order WebSocket tracking
+        if not old_tp_id:
+            with self._tp_orders_lock:
+                old_tp_id = self._tp_orders.get(side)
+
         if old_tp_id and not self.dry_run:
-            # We know the ID - cancel it directly
-            self.client.cancel_order(self.symbol, old_tp_id, self.category)
-            self.logger.debug(f"[{self.symbol}] Cancelled old TP order: {old_tp_id}")
-
-        elif not old_tp_id and not self.dry_run:
-            # We DON'T know the ID (e.g., after restart)
-            # Find and cancel ALL old TP orders for this side to avoid duplicates
+            # Cancel the tracked TP order
             try:
-                open_orders = self.client.get_open_orders(self.symbol, self.category)
-                position_idx = 1 if side == 'Buy' else 2
-
-                cancelled_count = 0
-                for order in open_orders:
-                    is_reduce_only = order.get('reduceOnly', False)
-                    order_pos_idx = int(order.get('positionIdx', 0))
-
-                    if is_reduce_only and order_pos_idx == position_idx:
-                        order_id = order.get('orderId')
-                        order_price = order.get('price')
-                        self.logger.info(
-                            f"🗑️  [{self.symbol}] Cancelling old {side} TP: {order_id} @ ${order_price}"
-                        )
-                        self.client.cancel_order(self.symbol, order_id, self.category)
-                        cancelled_count += 1
-
-                if cancelled_count > 0:
-                    self.logger.info(
-                        f"[{self.symbol}] Cancelled {cancelled_count} old TP order(s) for {side}"
-                    )
+                self.client.cancel_order(self.symbol, old_tp_id, self.category)
+                self.logger.debug(f"[{self.symbol}] Cancelled old TP order: {old_tp_id}")
             except Exception as e:
-                self.logger.error(
-                    f"[{self.symbol}] Failed to cancel old TP orders for {side}: {e}"
+                self.logger.warning(
+                    f"[{self.symbol}] Failed to cancel TP order {old_tp_id}: {e} "
+                    f"(may have been already filled/cancelled)"
                 )
 
         # Calculate positionIdx for the position we're closing
         # In Hedge Mode: positionIdx indicates which position to close
         # Buy position (LONG) = 1, Sell position (SHORT) = 2
-        position_idx = 1 if side == 'Buy' else 2
+        position_idx = TradingConstants.POSITION_IDX_LONG if side == 'Buy' else TradingConstants.POSITION_IDX_SHORT
 
         # Place new TP order
         if not self.dry_run:
@@ -948,6 +738,10 @@ class GridStrategy:
                 position_idx=position_idx  # Explicitly specify which position to close
             )
             self.pm.set_tp_order_id(side, new_tp_id)
+            # Also update Order WebSocket tracking
+            # (WebSocket will confirm, but we pre-fill for immediate availability)
+            with self._tp_orders_lock:
+                self._tp_orders[side] = new_tp_id
         else:
             self.logger.info(
                 f"[{self.symbol}] [DRY RUN] Would place TP: {tp_side} {total_qty} @ ${tp_price:.4f}"
@@ -965,6 +759,9 @@ class GridStrategy:
         Args:
             current_price: Current market price
         """
+        # Store current price (from WebSocket)
+        self.current_price = current_price
+
         # Block all operations if emergency stop was triggered
         if self.emergency_stopped:
             return
@@ -1078,31 +875,30 @@ class GridStrategy:
             new_size = self._usd_to_qty(new_margin_usd, current_price)
             grid_level = self.pm.get_position_count(side)
 
-            # Check if we have enough available balance (use exchange data directly)
+            # Check if we have enough available balance (using BalanceManager)
             if not self.dry_run:
                 try:
-                    balance_info = self.client.get_wallet_balance(account_type="UNIFIED")
-                    if balance_info and 'list' in balance_info:
-                        for account in balance_info['list']:
-                            if account.get('accountType') == 'UNIFIED':
-                                available_balance = float(account.get('totalAvailableBalance', 0))
+                    available_balance = self.balance_manager.get_available_balance()
 
-                                # Check if we have enough balance for this order
-                                if new_margin_usd > available_balance:
-                                    # Throttle warning to avoid spam (max once per minute)
-                                    current_time = time.time()
-                                    warning_key = f'insufficient_balance_{side}'
-                                    if warning_key not in self._last_warning_time:
-                                        self._last_warning_time[warning_key] = 0
+                    # Check if we have enough balance for this order
+                    if new_margin_usd > available_balance:
+                        # Throttle warning to avoid spam (max once per minute)
+                        current_time = time.time()
+                        warning_key = f'insufficient_balance_{side}'
+                        if warning_key not in self._last_warning_time:
+                            self._last_warning_time[warning_key] = 0
 
-                                    if current_time - self._last_warning_time[warning_key] >= self._warning_interval:
-                                        self.logger.warning(
-                                            f"⚠️ [{self.symbol}] Insufficient balance for {side} averaging: "
-                                            f"need ${new_margin_usd:.2f} MARGIN, available ${available_balance:.2f}"
-                                        )
-                                        self._last_warning_time[warning_key] = current_time
-                                    return  # Don't place order
-                                break
+                        if current_time - self._last_warning_time[warning_key] >= self._warning_interval:
+                            self.logger.warning(
+                                LogMessages.INSUFFICIENT_BALANCE.format(
+                                    symbol=self.symbol,
+                                    side=side,
+                                    needed=new_margin_usd,
+                                    available=available_balance
+                                )
+                            )
+                            self._last_warning_time[warning_key] = current_time
+                        return  # Don't place order
                 except Exception as e:
                     self.logger.error(f"[{self.symbol}] Failed to check balance before order: {e}")
                     return  # Don't place order if we can't verify balance
@@ -1160,185 +956,12 @@ class GridStrategy:
         except Exception as e:
             self.logger.error(f"[{self.symbol}] Failed to execute grid order: {e}")
 
-    def _check_take_profit(self, current_price: float):
-        """Check if we should take profit on any side"""
-
-        # Check LONG take profit
-        if self.pm.long_positions:
-            avg_long = self.pm.get_average_entry_price('Buy')
-            if avg_long:
-                price_change_pct = (current_price - avg_long) / avg_long * 100
-
-                if price_change_pct >= self.tp_pct:
-                    self._execute_take_profit('Buy', current_price, price_change_pct)
-
-        # Check SHORT take profit
-        if self.pm.short_positions:
-            avg_short = self.pm.get_average_entry_price('Sell')
-            if avg_short:
-                price_change_pct = (avg_short - current_price) / avg_short * 100
-
-                if price_change_pct >= self.tp_pct:
-                    self._execute_take_profit('Sell', current_price, price_change_pct)
-
-    def _execute_take_profit(self, side: str, current_price: float, profit_pct: float):
-        """
-        Execute take profit order
-
-        Args:
-            side: 'Buy' (LONG) or 'Sell' (SHORT)
-            current_price: Current market price
-            profit_pct: Profit percentage
-        """
-        try:
-            total_qty = self.pm.get_total_quantity(side)
-            pnl = self.pm.calculate_pnl(current_price, side)
-
-            self.logger.info(
-                f"[{self.symbol}] 💰 Take Profit triggered on {side}: {profit_pct:.2f}% gain, "
-                f"PnL: ${pnl:.2f}"
-            )
-
-            # NOTE: TP limit order already executed automatically, position is closed
-            # Just clean up our local state
-
-            # Clear TP order ID (it was already filled)
-            self.pm.set_tp_order_id(side, None)
-
-            # Remove local position tracking
-            self.pm.remove_all_positions(side)
-
-            # Получить реальные данные о закрытой позиции с биржи (REQUIRED - no fallback!)
-            if not self.dry_run:
-                # Подождать 2 секунды для обработки биржей
-                import time
-                time.sleep(2)
-
-                # Получить последнюю запись closed PnL с биржи
-                closed_records = self.client.get_closed_pnl(self.symbol, limit=1)
-                if not closed_records:
-                    raise RuntimeError(
-                        f"[{self.symbol}] No closed PnL records found after TP execution"
-                    )
-
-                record = closed_records[0]
-                if 'closedPnl' not in record:
-                    raise RuntimeError(
-                        f"[{self.symbol}] Closed PnL record missing 'closedPnl' field"
-                    )
-
-                actual_pnl = float(record['closedPnl'])
-                open_fee = float(record.get('openFee', 0))
-                close_fee = float(record.get('closeFee', 0))
-                funding_fee = 0.0
-
-                self.logger.info(
-                    f"[{self.symbol}] 📊 Exchange confirmed: "
-                    f"PnL=${actual_pnl:.4f}, "
-                    f"Open Fee=${open_fee:.4f}, "
-                    f"Close Fee=${close_fee:.4f}"
-                )
-            else:
-                # In dry run, use calculated PnL
-                actual_pnl = pnl
-                open_fee = 0.0
-                close_fee = 0.0
-                funding_fee = 0.0
-
-            # Log trade (closing)
-            close_side = "Sell" if side == "Buy" else "Buy"
-            log_trade(
-                self.logger,
-                side=close_side,
-                price=current_price,
-                qty=total_qty,
-                reason=f"Take Profit ({profit_pct:.2f}%, PnL: ${pnl:.2f})",
-                dry_run=self.dry_run,
-                account_prefix=f"{self.id_str}_"
-            )
-
-            # Log to metrics tracker with real PnL and fees from exchange
-            if self.metrics_tracker:
-                self.metrics_tracker.log_trade(
-                    symbol=self.symbol,
-                    side=close_side,
-                    action="CLOSE",
-                    price=current_price,
-                    quantity=total_qty,
-                    reason=f"Take Profit ({profit_pct:.2f}%)",
-                    pnl=actual_pnl,  # Real PnL from exchange
-                    open_fee=open_fee,  # Real opening fee
-                    close_fee=close_fee,  # Real closing fee
-                    funding_fee=funding_fee  # Funding fees (if available)
-                )
-
-            # 🔄 ВАЖНО: Сразу открыть новую начальную позицию
-            # Convert USD to qty
-            initial_qty = self._usd_to_qty(self.initial_size_usd, current_price)
-
-            self.logger.info(
-                f"[{self.symbol}] ♻️  Переоткрываю начальную {side} позицию: ${self.initial_size_usd} "
-                f"({initial_qty:.6f} {self.symbol}) @ ${current_price:.4f}"
-            )
-
-            # Открыть новый ордер
-            if not self.dry_run:
-                response = self.client.place_order(
-                    symbol=self.symbol,
-                    side=side,
-                    qty=initial_qty,
-                    order_type="Market",
-                    category=self.category
-                )
-                self.logger.info(f"[{self.symbol}] Reopen order response: {response}")
-
-            # Добавить новую начальную позицию в manager
-            self.pm.add_position(
-                side=side,
-                entry_price=current_price,
-                quantity=initial_qty,
-                grid_level=0
-            )
-
-            log_trade(
-                self.logger,
-                side=side,
-                price=current_price,
-                qty=initial_qty,
-                reason="Reopen after Take Profit",
-                dry_run=self.dry_run,
-                account_prefix=f"{self.id_str}_"
-            )
-
-            # Log to metrics tracker
-            if self.metrics_tracker:
-                self.metrics_tracker.log_trade(
-                    symbol=self.symbol,
-                    side=side,
-                    action="OPEN",
-                    price=current_price,
-                    quantity=initial_qty,
-                    reason="Reopen after TP",
-                    pnl=None
-                )
-
-            # Place new TP order for reopened position
-            self._update_tp_order(side)
-
-            self.logger.info(
-                f"[{self.symbol}] ✅ Новая {side} позиция открыта: {initial_qty} @ ${current_price:.4f}"
-            )
-
-        except Exception as e:
-            self.logger.error(f"[{self.symbol}] Failed to execute take profit: {e}")
-
     def _check_risk_limits(self, current_price: float) -> bool:
         """
         Check risk limits (Account MM Rate only - balance checked before averaging)
 
         For hedged positions (LONG+SHORT), monitors Account Maintenance Margin Rate
-        to detect liquidation risk. Checks are throttled to every 30 seconds to avoid
-        API rate limits (balance changes only on execution events, not price ticks).
+        to detect liquidation risk. Uses BalanceManager with caching to avoid API rate limits.
 
         Args:
             current_price: Current market price
@@ -1350,52 +973,35 @@ class GridStrategy:
         if self.dry_run:
             account_mm_rate = 0.17  # Mock: safe value
         else:
-            # Throttled check: only fetch from API every 30 seconds
-            current_time = time.time()
-            if current_time - self._last_mm_rate_check_time >= self._mm_rate_check_interval:
-                # Fetch fresh data from exchange
-                balance_info = self.client.get_wallet_balance(account_type="UNIFIED")
-                if balance_info and 'list' in balance_info:
-                    for account in balance_info['list']:
-                        if account.get('accountType') == 'UNIFIED':
-                            # accountMMRate = Account Maintenance Margin Rate (%)
-                            # This is the ONLY metric that matters for hedged positions!
-                            account_mm_rate_str = account.get('accountMMRate', '')
-                            if account_mm_rate_str and account_mm_rate_str != '':
-                                # Convert to percentage (Bybit returns as decimal, e.g. "0.0017" = 0.17%)
-                                self._cached_mm_rate = float(account_mm_rate_str) * 100
-                            else:
-                                self._cached_mm_rate = None
-                            break
-                else:
-                    # API failure - fail-fast (no fallbacks!)
-                    raise RuntimeError(
-                        f"[{self.symbol}] Failed to get wallet balance from exchange - cannot check risk limits"
-                    )
-
-                # Update last check time
-                self._last_mm_rate_check_time = current_time
-
-            # Use cached value between checks
-            account_mm_rate = self._cached_mm_rate
+            # Get MM Rate from BalanceManager (with caching)
+            try:
+                account_mm_rate = self.balance_manager.get_mm_rate()
+            except Exception as e:
+                # API failure - fail-fast (no fallbacks!)
+                raise RuntimeError(
+                    f"[{self.symbol}] Failed to get wallet balance from exchange - cannot check risk limits"
+                ) from e
 
         # Check Account Maintenance Margin Rate (for hedged positions)
         # This is the CORRECT way to check liquidation risk for LONG+SHORT strategy
         if not self.dry_run and account_mm_rate is not None:
             # Log current MM rate for monitoring (throttled to avoid spam)
-            if account_mm_rate > 50.0:  # Warning if > 50%
+            if account_mm_rate > TradingConstants.MM_RATE_WARNING_THRESHOLD:
                 current_time = time.time()
                 if current_time - self._last_warning_time['mm_rate'] >= self._warning_interval:
                     self.logger.warning(
-                        f"⚠️ [{self.symbol}] Account Maintenance Margin Rate: {account_mm_rate:.2f}% (caution!)"
+                        LogMessages.HIGH_MM_RATE.format(
+                            symbol=self.symbol,
+                            mm_rate=account_mm_rate
+                        )
                     )
                     self._last_warning_time['mm_rate'] = current_time
 
             # Emergency close if >= threshold (use instance variable set in __init__)
             if account_mm_rate >= self.mm_rate_threshold:
+                reason = f"Account MM Rate {account_mm_rate:.2f}% >= {self.mm_rate_threshold}%"
                 self.logger.error(
-                    f"💥 CRITICAL: Account MM Rate {account_mm_rate:.2f}% >= {self.mm_rate_threshold}%! "
-                    f"EMERGENCY CLOSE ALL POSITIONS!"
+                    LogMessages.EMERGENCY_CLOSE.format(reason=reason)
                 )
 
                 # Close ALL positions (both LONG and SHORT)
@@ -1468,3 +1074,233 @@ class GridStrategy:
 
         except Exception as e:
             self.logger.error(f"[{self.symbol}] Failed to emergency close: {e}")
+
+    def on_position_update(self, position_data: dict):
+        """
+        Handle position update from WebSocket
+
+        Called when position stream sends an update. Detects position closures
+        and calculates realized PnL from cumRealisedPnl delta.
+
+        Args:
+            position_data: Position data from Bybit WebSocket
+        """
+        try:
+            side = position_data.get('side')  # 'Buy' or 'Sell'
+            size = position_data.get('size')  # Position size (string)
+            cum_realised_pnl = position_data.get('cumRealisedPnl')  # Cumulative realized PnL
+            avg_price = position_data.get('avgPrice')  # Average entry price
+
+            # Convert size to float
+            size_float = float(size) if size else 0.0
+
+            # Log position update
+            self.logger.debug(
+                f"[{self.symbol}] Position update: {side} size={size} "
+                f"avgPrice={avg_price} cumPnL={cum_realised_pnl}"
+            )
+
+            # Detect position closure: size becomes "0" or close to 0
+            if size_float < 0.001:
+                self.logger.info(
+                    f"[{self.symbol}] Position CLOSED detected via WebSocket: {side}"
+                )
+
+                # Calculate realized PnL from cumulative delta
+                if cum_realised_pnl:
+                    cum_pnl_float = float(cum_realised_pnl)
+                    with self._pnl_lock:
+                        last_cum_pnl = self._last_cum_realised_pnl.get(side, 0.0)
+                        realized_pnl = cum_pnl_float - last_cum_pnl
+
+                        # Update tracked cumulative PnL
+                        self._last_cum_realised_pnl[side] = cum_pnl_float
+
+                    self.logger.info(
+                        f"💰 [{self.symbol}] {side} position closed - "
+                        f"Realized PnL: ${realized_pnl:.4f} "
+                        f"(cumPnL: {last_cum_pnl:.4f} → {cum_pnl_float:.4f})"
+                    )
+
+                    # Log to metrics
+                    if self.metrics_tracker:
+                        # Determine close reason (positive = TP, negative = loss/liquidation)
+                        close_reason = "Take Profit" if realized_pnl > 0 else "Loss/Liquidation"
+
+                        self.metrics_tracker.log_trade(
+                            symbol=self.symbol,
+                            side='Sell' if side == 'Buy' else 'Buy',  # Opposite side for close
+                            action="CLOSE",
+                            price=float(avg_price) if avg_price else 0.0,
+                            quantity=0.0,  # Closed, qty unknown from this message
+                            reason=close_reason,
+                            pnl=realized_pnl
+                        )
+
+                    # Clear local positions for this side
+                    self.pm.remove_all_positions(side)
+
+                    # Reopen position if not in emergency stop
+                    if not self.emergency_stopped and not self.dry_run:
+                        current_price = float(avg_price) if avg_price else 0.0
+                        if current_price > 0:
+                            try:
+                                self._open_initial_position(side, current_price)
+                            except Exception as e:
+                                self.logger.error(
+                                    f"[{self.symbol}] Failed to reopen {side} position after WebSocket close: {e}"
+                                )
+
+            else:
+                # Position still open (size > 0)
+
+                # Check if we have this position tracked locally
+                local_qty = self.pm.get_total_quantity(side)
+
+                if local_qty == 0:
+                    # Position exists on exchange but not tracked locally
+                    # This happens on bot restart - restore from Position WebSocket snapshot
+                    self.logger.info(
+                        f"📥 [{self.symbol}] Restoring {side} position from Position WebSocket: "
+                        f"{size_float} @ ${avg_price}"
+                    )
+
+                    # Restore position as single entry (grid_level=0)
+                    # Note: We lose grid level details, but exchange avgPrice is accurate
+                    self.pm.add_position(
+                        side=side,
+                        entry_price=float(avg_price) if avg_price else 0.0,
+                        quantity=size_float,
+                        grid_level=0  # Restored position (no grid history)
+                    )
+
+                    # Create TP order for restored position
+                    if not self.dry_run:
+                        try:
+                            self._update_tp_order(side)
+                            self.logger.info(
+                                f"✅ [{self.symbol}] {side} position restored and TP order created"
+                            )
+                        except Exception as e:
+                            self.logger.error(
+                                f"[{self.symbol}] Failed to create TP order for restored {side} position: {e}"
+                            )
+
+                    # Log to metrics
+                    if self.metrics_tracker:
+                        self.metrics_tracker.log_trade(
+                            symbol=self.symbol,
+                            side=side,
+                            action="RESTORE",
+                            price=float(avg_price) if avg_price else 0.0,
+                            quantity=size_float,
+                            reason="Position restored from WebSocket snapshot",
+                            pnl=None
+                        )
+
+                # Update cumulative PnL tracking if provided
+                if cum_realised_pnl:
+                    with self._pnl_lock:
+                        self._last_cum_realised_pnl[side] = float(cum_realised_pnl)
+
+        except Exception as e:
+            self.logger.error(
+                f"[{self.symbol}] Error processing position update: {e}",
+                exc_info=True
+            )
+
+    def on_wallet_update(self, wallet_data: dict):
+        """
+        Handle wallet update from WebSocket
+
+        Called when wallet stream sends an update. Updates balance and MM Rate cache.
+
+        Args:
+            wallet_data: Wallet data from Bybit WebSocket
+        """
+        try:
+            # Extract balance and MM Rate
+            total_available = wallet_data.get('totalAvailableBalance')
+            account_mm_rate = wallet_data.get('accountMMRate')
+
+            if total_available is not None:
+                balance = float(total_available)
+
+                # Update BalanceManager cache from WebSocket
+                if self.balance_manager:
+                    # Convert MM Rate from decimal to percentage (e.g., 0.0017 -> 0.17%)
+                    mm_rate_pct = None
+                    if account_mm_rate and account_mm_rate != '':
+                        mm_rate_pct = float(account_mm_rate) * 100
+
+                    self.balance_manager.update_from_websocket(balance, mm_rate_pct)
+
+                    self.logger.debug(
+                        f"[{self.symbol}] Wallet update: ${balance:.2f}, "
+                        f"MM Rate: {mm_rate_pct:.4f}%" if mm_rate_pct else f"${balance:.2f}"
+                    )
+
+        except Exception as e:
+            self.logger.error(
+                f"[{self.symbol}] Error processing wallet update: {e}",
+                exc_info=True
+            )
+
+    def on_order_update(self, order_data: dict):
+        """
+        Handle order update from WebSocket
+
+        Called when order stream sends an update. Tracks TP order IDs automatically.
+
+        Args:
+            order_data: Order data from Bybit WebSocket
+        """
+        try:
+            order_id = order_data.get('orderId')
+            order_status = order_data.get('orderStatus')
+            order_type = order_data.get('orderType')
+            side = order_data.get('side')
+            position_idx = order_data.get('positionIdx')
+
+            # Only track Take Profit orders
+            if order_type == 'Market' and order_status in ['New', 'Filled', 'Cancelled']:
+                # Determine which side this TP order belongs to
+                # positionIdx: 1=LONG, 2=SHORT
+                if position_idx == '1':  # LONG TP (closes Buy position)
+                    track_side = 'Buy'
+                elif position_idx == '2':  # SHORT TP (closes Sell position)
+                    track_side = 'Sell'
+                else:
+                    return  # Unknown position index
+
+                if order_status == 'New':
+                    # New TP order created - track it
+                    with self._tp_orders_lock:
+                        self._tp_orders[track_side] = order_id
+                    self.logger.debug(
+                        f"[{self.symbol}] TP order tracked: {track_side} -> {order_id}"
+                    )
+
+                elif order_status == 'Filled':
+                    # TP order filled - remove from tracking
+                    with self._tp_orders_lock:
+                        if track_side in self._tp_orders:
+                            del self._tp_orders[track_side]
+                    self.logger.info(
+                        f"[{self.symbol}] TP order filled: {track_side} orderId={order_id}"
+                    )
+
+                elif order_status == 'Cancelled':
+                    # TP order cancelled - remove from tracking
+                    with self._tp_orders_lock:
+                        if track_side in self._tp_orders:
+                            del self._tp_orders[track_side]
+                    self.logger.debug(
+                        f"[{self.symbol}] TP order cancelled: {track_side} orderId={order_id}"
+                    )
+
+        except Exception as e:
+            self.logger.error(
+                f"[{self.symbol}] Error processing order update: {e}",
+                exc_info=True
+            )

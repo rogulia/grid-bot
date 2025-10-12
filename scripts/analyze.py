@@ -18,6 +18,8 @@ import json
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from src.utils.timezone import now_helsinki, format_helsinki
+
 try:
     import pandas as pd
     import matplotlib.pyplot as plt
@@ -42,9 +44,7 @@ def load_performance_metrics(account_id="001", date=None):
     """
     if date is None:
         # Use today's date in Helsinki timezone
-        from datetime import datetime
-        import pytz
-        date = datetime.now(pytz.timezone('Europe/Helsinki')).strftime("%Y-%m-%d")
+        date = format_helsinki(fmt="%Y-%m-%d")
 
     file_path = f"data/{account_id}_performance_metrics_{date}.csv"
 
@@ -70,9 +70,7 @@ def load_trades_history(account_id="001", date=None):
     """
     if date is None:
         # Use today's date in Helsinki timezone
-        from datetime import datetime
-        import pytz
-        date = datetime.now(pytz.timezone('Europe/Helsinki')).strftime("%Y-%m-%d")
+        date = format_helsinki(fmt="%Y-%m-%d")
 
     file_path = f"data/{account_id}_trades_history_{date}.csv"
 
@@ -99,7 +97,7 @@ def filter_by_period(df, period):
     if period == 'all':
         return df
 
-    now = datetime.now()
+    now = now_helsinki()
 
     if period.endswith('h'):
         hours = int(period[:-1])

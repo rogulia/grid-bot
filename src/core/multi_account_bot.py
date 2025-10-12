@@ -38,8 +38,6 @@ class MultiAccountBot:
         # All accounts
         self.accounts: List[TradingAccount] = []
 
-        self.running = False
-
     def register_account(self, account: TradingAccount):
         """
         Register account and subscribe to its symbols

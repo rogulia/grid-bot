@@ -3,6 +3,7 @@
 import pytest
 from datetime import datetime
 from src.strategy.position_manager import PositionManager, Position
+from src.utils.timezone import now_helsinki
 
 
 class TestPosition:
@@ -14,7 +15,7 @@ class TestPosition:
             side='Buy',
             entry_price=100.0,
             quantity=0.5,
-            timestamp=datetime.now(),
+            timestamp=now_helsinki(),
             grid_level=0
         )
 
@@ -214,138 +215,3 @@ class TestPositionManager:
         assert position_manager.get_tp_order_id('Buy') is None
 
 
-class TestUnrealizedPnLWithFees:
-    """Tests for calculate_unrealized_pnl_with_fees method"""
-
-    def test_calculate_fees_winning_long_position(self, position_manager):
-        """Test fee calculation for winning LONG position"""
-        # Add position: 1.0 SOL @ $100
-        position_manager.add_position('Buy', 100.0, 1.0, 0)
-
-        # Current price: $105 → $5 profit
-        current_price = 105.0
-        exchange_unrealized = 5.0  # From exchange API
-
-        result = position_manager.calculate_unrealized_pnl_with_fees(
-            current_price, 'Buy', exchange_unrealized
-        )
-
-        # Check base PnL
-        assert result['base_pnl'] == 5.0
-
-        # Check estimated fees (0.06% = 0.0006)
-        # Open fee: 1.0 * 100 * 0.0006 = 0.06
-        assert result['estimated_open_fee'] == pytest.approx(0.06, abs=0.01)
-
-        # Close fee: 1.0 * 105 * 0.0006 = 0.063
-        assert result['estimated_close_fee'] == pytest.approx(0.063, abs=0.01)
-
-        # Net PnL: 5.0 - 0.06 - 0.063 = 4.877
-        assert result['net_pnl'] == pytest.approx(4.877, abs=0.01)
-        assert result['net_pnl'] < result['base_pnl']  # Less than base due to fees
-
-    def test_calculate_fees_losing_short_position(self, position_manager):
-        """Test fee calculation for losing SHORT position"""
-        # Add position: 0.5 SOL @ $100
-        position_manager.add_position('Sell', 100.0, 0.5, 0)
-
-        # Current price: $105 → -$2.5 loss
-        current_price = 105.0
-        exchange_unrealized = -2.5  # From exchange API
-
-        result = position_manager.calculate_unrealized_pnl_with_fees(
-            current_price, 'Sell', exchange_unrealized
-        )
-
-        # Check base PnL
-        assert result['base_pnl'] == -2.5
-
-        # Check estimated fees
-        # Open fee: 0.5 * 100 * 0.0006 = 0.03
-        assert result['estimated_open_fee'] == pytest.approx(0.03, abs=0.01)
-
-        # Close fee: 0.5 * 105 * 0.0006 = 0.0315
-        assert result['estimated_close_fee'] == pytest.approx(0.0315, abs=0.01)
-
-        # Net PnL: -2.5 - 0.03 - 0.0315 = -2.5615 (more loss due to fees)
-        assert result['net_pnl'] == pytest.approx(-2.5615, abs=0.01)
-        assert result['net_pnl'] < result['base_pnl']  # More negative
-
-    def test_calculate_fees_no_position(self, position_manager):
-        """Test fee calculation with no position"""
-        result = position_manager.calculate_unrealized_pnl_with_fees(
-            100.0, 'Buy', 0.0
-        )
-
-        assert result['base_pnl'] == 0.0
-        assert result['estimated_open_fee'] == 0.0
-        assert result['estimated_close_fee'] == 0.0
-        assert result['net_pnl'] == 0.0
-
-    def test_calculate_fees_multiple_positions(self, position_manager):
-        """Test fee calculation with multiple averaged positions"""
-        # Add multiple positions (averaging scenario)
-        position_manager.add_position('Buy', 100.0, 0.5, 0)  # $50 value
-        position_manager.add_position('Buy', 95.0, 0.5, 1)   # $47.5 value
-        # Total: 1.0 SOL, avg entry ~$97.5
-
-        # Current price: $100
-        current_price = 100.0
-        # Unrealized: 1.0 * (100 - 97.5) = 2.5
-        exchange_unrealized = 2.5
-
-        result = position_manager.calculate_unrealized_pnl_with_fees(
-            current_price, 'Buy', exchange_unrealized
-        )
-
-        # Average entry price
-        avg_entry = position_manager.get_average_entry_price('Buy')
-        assert avg_entry == pytest.approx(97.5)
-
-        # Open fee based on average: 1.0 * 97.5 * 0.0006 = 0.0585
-        assert result['estimated_open_fee'] == pytest.approx(0.0585, abs=0.01)
-
-        # Close fee: 1.0 * 100 * 0.0006 = 0.06
-        assert result['estimated_close_fee'] == pytest.approx(0.06, abs=0.01)
-
-        # Net PnL: 2.5 - 0.0585 - 0.06 = 2.3815
-        assert result['net_pnl'] == pytest.approx(2.3815, abs=0.01)
-
-    def test_calculate_fees_custom_fee_rate(self, position_manager):
-        """Test fee calculation with custom fee rate"""
-        position_manager.add_position('Buy', 100.0, 1.0, 0)
-
-        # Use maker fee rate (0.02% = 0.0002)
-        result = position_manager.calculate_unrealized_pnl_with_fees(
-            105.0, 'Buy', 5.0, taker_fee_rate=0.0002
-        )
-
-        # Open fee: 100 * 0.0002 = 0.02
-        assert result['estimated_open_fee'] == pytest.approx(0.02, abs=0.01)
-
-        # Close fee: 105 * 0.0002 = 0.021
-        assert result['estimated_close_fee'] == pytest.approx(0.021, abs=0.01)
-
-        # Net PnL: 5.0 - 0.02 - 0.021 = 4.959
-        assert result['net_pnl'] == pytest.approx(4.959, abs=0.01)
-
-    def test_calculate_fees_breakeven_position(self, position_manager):
-        """Test fee calculation at breakeven price"""
-        position_manager.add_position('Buy', 100.0, 1.0, 0)
-
-        # Current price = entry price
-        current_price = 100.0
-        exchange_unrealized = 0.0
-
-        result = position_manager.calculate_unrealized_pnl_with_fees(
-            current_price, 'Buy', exchange_unrealized
-        )
-
-        assert result['base_pnl'] == 0.0
-
-        # Even at breakeven, fees still apply
-        assert result['estimated_open_fee'] > 0
-        assert result['estimated_close_fee'] > 0
-
-        # Net PnL is negative due to fees
-        assert result['net_pnl'] < 0  # Loss from fees even at breakeven!

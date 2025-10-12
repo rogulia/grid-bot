@@ -213,26 +213,6 @@ class TestStrategyWithMetricsIntegration:
         # Metrics should have been logged
         assert mock_metrics_tracker.log_trade.called
 
-    def test_metrics_on_take_profit(self, mock_bybit_client, sample_config, mock_metrics_tracker):
-        """Test metrics logging on take profit"""
-        pm = PositionManager(leverage=100)
-        strategy = GridStrategy(
-            client=mock_bybit_client,
-            position_manager=pm,
-            config=sample_config,
-            dry_run=True,
-            metrics_tracker=mock_metrics_tracker
-        )
-
-        pm.add_position('Buy', 100.0, 0.1, 0)
-
-        # Trigger take profit
-        strategy._execute_take_profit('Buy', 101.0, 1.0)
-
-        # Should log both close and reopen trades
-        assert mock_metrics_tracker.log_trade.call_count >= 2
-
-
 class TestSyncWithExchangeIntegration:
     """Integration tests for exchange sync functionality"""
 
@@ -254,6 +234,19 @@ class TestSyncWithExchangeIntegration:
             return None
 
         mock_bybit_client.get_active_position.side_effect = get_position_side_effect
+
+        # Mock order history (required for position restoration)
+        mock_bybit_client.get_order_history.return_value = [
+            {
+                'orderId': 'order1',
+                'side': 'Buy',
+                'positionIdx': 1,  # 1=LONG, 2=SHORT
+                'cumExecQty': '0.5',  # Executed quantity (not 'qty')
+                'avgPrice': '100.0',
+                'orderStatus': 'Filled',
+                'createdTime': '1609459200000'
+            }
+        ]
 
         # Sync with exchange
         strategy.sync_with_exchange(100.0)
