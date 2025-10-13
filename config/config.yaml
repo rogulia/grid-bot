@@ -27,14 +27,14 @@ accounts:
         take_profit_percent: 1.0         # Take profit %
         max_grid_levels_per_side: 10
 
-      - symbol: "TONUSDT"
-        category: "linear"
-        leverage: 50
-        initial_position_size_usd: 1.0
-        grid_step_percent: 1.0
-        averaging_multiplier: 2.0
-        take_profit_percent: 1.0
-        max_grid_levels_per_side: 10
+      # - symbol: "TONUSDT"
+      #   category: "linear"
+      #   leverage: 50
+      #   initial_position_size_usd: 1.0
+      #   grid_step_percent: 1.0
+      #   averaging_multiplier: 2.0
+      #   take_profit_percent: 1.0
+      #   max_grid_levels_per_side: 10
 
   # Account 2 (ID: 2) - Example for second user
   # Uncomment to add second account:

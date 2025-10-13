@@ -154,16 +154,27 @@ class BybitWebSocket:
 
                     # Only process UNIFIED account
                     if account_type == 'UNIFIED':
+                        # Extract ALL balance fields from WebSocket
                         total_available = wallet.get('totalAvailableBalance')
                         account_mm_rate = wallet.get('accountMMRate')
+                        total_initial_margin = wallet.get('totalInitialMargin')
+                        total_maintenance_margin = wallet.get('totalMaintenanceMargin')
 
-                        # Log wallet update
-                        self.logger.debug(
-                            f"Wallet update: balance=${total_available} "
-                            f"MM Rate={account_mm_rate}"
-                        )
+                        # Build log message with all fields
+                        log_parts = []
+                        if total_available is not None:
+                            log_parts.append(f"balance=${total_available}")
+                        if account_mm_rate is not None:
+                            log_parts.append(f"MM Rate={account_mm_rate}")
+                        if total_initial_margin is not None:
+                            log_parts.append(f"IM=${total_initial_margin}")
+                        if total_maintenance_margin is not None:
+                            log_parts.append(f"MM=${total_maintenance_margin}")
 
-                        # Call wallet callback if set
+                        self.logger.debug(f"Wallet update: {', '.join(log_parts)}")
+
+                        # Call wallet callback with full wallet data
+                        # Callback will extract needed fields
                         if self.wallet_callback:
                             self.wallet_callback(wallet)
 

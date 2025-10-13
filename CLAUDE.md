@@ -6,10 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 SOL-Trader is a **multi-account** automated Bybit futures trading bot implementing a dual-sided grid strategy (simultaneous LONG + SHORT positions) for perpetual futures. The bot supports multiple isolated accounts (for SaaS model), each with independent API credentials, strategies, risk limits, and data files. Each account uses position averaging with a multiplier on each grid level and takes profit when prices reverse by a configured percentage.
 
-**Language:** Python 3.9+
+**Language:** Python 3.9+ (minimum required)
 **Exchange:** Bybit (Demo and Production)
 **Package Manager:** UV (Universal Virtualenv)
 **Architecture:** Multi-account SaaS-ready with complete data isolation
+**Testing:** 169 comprehensive unit and integration tests
 
 ## Core Architecture
 
@@ -176,20 +177,27 @@ python scripts/check_hedge_mode.py     # Verify hedge mode configuration
 sudo bash scripts/setup_service.sh
 
 # Control service using bot_control.sh
-./scripts/bot_control.sh start         # Start bot service
-./scripts/bot_control.sh stop          # Stop bot service
-./scripts/bot_control.sh restart       # Restart bot service
-./scripts/bot_control.sh status        # Check service status
-./scripts/bot_control.sh logs          # View systemd logs (real-time)
-./scripts/bot_control.sh logs-bot      # View bot file logs
+# Note: Ensure script is executable: chmod +x scripts/bot_control.sh
+bash scripts/bot_control.sh start      # Start bot service
+bash scripts/bot_control.sh stop       # Stop bot service
+bash scripts/bot_control.sh restart    # Restart bot service
+bash scripts/bot_control.sh status     # Check service status
+bash scripts/bot_control.sh logs       # View systemd logs (real-time)
+bash scripts/bot_control.sh logs-bot   # View bot file logs
+
+# Alternative: Direct systemd commands
+sudo systemctl start sol-trader
+sudo systemctl stop sol-trader
+sudo systemctl status sol-trader
+sudo journalctl -u sol-trader -f
 
 # Alternative: Run in screen session (simpler, no auto-restart)
-./scripts/run_background.sh
+bash scripts/run_background.sh
 ```
 
 ### Testing
 ```bash
-# Run all tests (113 total)
+# Run all tests (169 total)
 pytest tests/ -v
 
 # Run specific test file
@@ -215,6 +223,8 @@ All configuration in `config/config.yaml`:
 **Multi-account structure:**
 Bot supports multiple isolated accounts. Each account represents one user/client with full isolation.
 
+**IMPORTANT:** Each account MUST have at least one strategy configured. The bot will fail to start without a strategy.
+
 ```yaml
 accounts:
   - id: 1                                  # Unique ID (1-999)
@@ -227,8 +237,8 @@ accounts:
     risk_management:                        # Per-account risk limits
       mm_rate_threshold: 90.0              # Emergency close when Account MM Rate >= this %
 
-    strategies:                             # Per-account strategies
-      - symbol: "DOGEUSDT"                 # Trading pair
+    strategies:                             # Per-account strategies (REQUIRED - at least one!)
+      - symbol: "DOGEUSDT"                 # Trading pair (REQUIRED!)
         category: "linear"                  # Contract type
         leverage: 75                        # Trading leverage (HIGH RISK)
         initial_position_size_usd: 1.0     # Starting margin in USD
@@ -600,7 +610,7 @@ python scripts/check_balance.py
 
 **Run tests:**
 ```bash
-pytest tests/ -v  # All 113 tests
+pytest tests/ -v  # All 169 tests
 ```
 
 ## Common Development Workflows

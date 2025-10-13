@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import time
+import threading
 import json
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -99,6 +100,21 @@ class TradingAccount:
 
         # Initial sync flags (per symbol) - sync on first price update from WebSocket
         self._initial_sync_done: Dict[str, bool] = {}
+
+        # Account-level lock for atomicity (prevents race conditions in multi-symbol execution)
+        # ONE lock per account protects all critical operations
+        self._account_lock = threading.Lock()
+
+        # Early Freeze state (Phase 2: Advanced Risk Management)
+        # Preventive mechanism to block averaging before panic mode
+        self.averaging_frozen = False
+        self.freeze_reason: Optional[str] = None
+
+        # Panic Mode state (Phase 3: Advanced Risk Management)
+        # Critical state when IM is severely constrained
+        self.panic_mode = False
+        self.panic_reason: Optional[str] = None
+        self.panic_entered_at: Optional[float] = None
 
     def _setup_logging(self):
         """
@@ -244,7 +260,7 @@ class TradingAccount:
             # Merge strategy config with risk config
             combined_config = {**strategy_config, **self.risk_config}
 
-            # Create grid strategy (pass account_id, logger, and balance_manager!)
+            # Create grid strategy (pass account_id, logger, balance_manager, and account reference!)
             self.strategies[symbol] = GridStrategy(
                 client=self.client,
                 position_manager=self.position_managers[symbol],
@@ -253,7 +269,8 @@ class TradingAccount:
                 metrics_tracker=self.metrics_tracker,
                 account_id=self.account_id,          # ✅ Pass ID
                 account_logger=self.logger,          # ✅ Pass logger
-                balance_manager=self.balance_manager  # ✅ Pass shared balance manager
+                balance_manager=self.balance_manager, # ✅ Pass shared balance manager
+                trading_account=self                 # ✅ Pass account reference for reserve checking
             )
 
             # Mark that initial sync hasn't happened yet (will be done on first price update from WebSocket)
@@ -437,7 +454,35 @@ class TradingAccount:
                 self._initial_sync_done[symbol] = True
                 self.logger.info(f"✅ [{symbol}] Initial sync completed")
 
+            # Check Early Freeze trigger (Phase 2: Advanced Risk Management)
+            # This runs BEFORE averaging checks in on_price_update()
+            should_freeze, freeze_reason = self.check_early_freeze_trigger()
+
+            if should_freeze and not self.averaging_frozen:
+                # Activate Early Freeze
+                self.freeze_all_averaging(freeze_reason)
+
+            elif not should_freeze and self.averaging_frozen and not self.panic_mode:
+                # Conditions recovered, unfreeze (only if NOT in panic mode)
+                self.unfreeze_all_averaging()
+
+            # Check Panic Mode triggers (Phase 3: Advanced Risk Management)
+            # Check AFTER Early Freeze but BEFORE emergency close
+            if not self.panic_mode:
+                # Check LOW_IM trigger (primary)
+                panic_low_im, panic_reason = self.check_panic_trigger_low_im()
+                if panic_low_im:
+                    self.enter_panic_mode(panic_reason)
+
+                # Check HIGH_IMBALANCE trigger (secondary)
+                if not panic_low_im:
+                    panic_imbalance, panic_reason = self.check_panic_trigger_high_imbalance()
+                    if panic_imbalance:
+                        self.enter_panic_mode(panic_reason)
+
             # Execute strategy logic
+            # Note: If averaging_frozen=True, reserve checking will block averaging
+            # Emergency close check (MM Rate) happens inside strategy.on_price_update()
             strategy.on_price_update(price)
 
             # Periodic sync and logging (every 60 seconds)
@@ -471,6 +516,13 @@ class TradingAccount:
                         short_pnl=short_pnl
                     )
 
+                # Log Initial Margin status (Phase 6: Advanced Risk Management)
+                # Log once per 60s for entire account (not per symbol)
+                last_im_log = self.last_log_times.get('_im_monitoring', 0)
+                if current_time - last_im_log >= 60:
+                    self.log_im_status()
+                    self.last_log_times['_im_monitoring'] = current_time
+
                 self.last_log_times[symbol] = current_time
 
         except Exception as e:
@@ -484,6 +536,884 @@ class TradingAccount:
             List of symbol names
         """
         return [s['symbol'] for s in self.strategies_config]
+
+    @staticmethod
+    def calculate_safety_factor(atr_percent: float) -> float:
+        """
+        Calculate dynamic safety factor based on market volatility (ATR)
+
+        Safety factor consists of three components:
+        1. Base buffer (10%): covers fees, rounding errors
+        2. Gap buffer (2-10%): covers price movements during execution (dynamic!)
+        3. Tier buffer (5%): covers Portfolio Margin tier rate non-linearity
+
+        Args:
+            atr_percent: Average True Range as percentage of price (e.g., 1.5 for 1.5%)
+
+        Returns:
+            Safety factor multiplier (1.17 to 1.25)
+        """
+        # 1. Base buffer: комиссии + округления
+        base_buffer = 0.10  # +10%
+
+        # 2. Gap buffer: проскальзывание и гэпы (динамический на основе ATR!)
+        if atr_percent < 1.0:
+            gap_buffer = 0.02  # +2% (низкая волатильность)
+        elif atr_percent < 2.0:
+            gap_buffer = 0.05  # +5% (средняя волатильность)
+        else:
+            gap_buffer = 0.10  # +10% (высокая волатильность)
+
+        # 3. Tier buffer: Portfolio Margin non-linearity
+        tier_buffer = 0.05  # +5% (постоянный запас на tier rates)
+
+        # Итоговый safety factor
+        safety_factor = 1.0 + base_buffer + gap_buffer + tier_buffer
+
+        return safety_factor
+
+    def calculate_account_safety_reserve(self) -> float:
+        """
+        Calculate dynamic safety reserve for the entire account
+
+        Safety reserve is the minimum margin needed to balance ALL symbols
+        when any side gets closed. This prevents catastrophic scenarios where
+        a side closes but we don't have margin to rebalance.
+
+        Uses dynamic safety factor based on worst-case ATR across all symbols.
+
+        Returns:
+            Safety reserve in USD (sum of all symbol imbalances × safety_factor)
+        """
+        total_reserve = 0.0
+        atr_values = []
+
+        # Calculate reserve for each symbol and collect ATR values
+        for symbol, strategy in self.strategies.items():
+            try:
+                # Get position manager for this symbol
+                pm = strategy.pm
+
+                # Get current price from strategy
+                current_price = strategy.current_price
+                if current_price <= 0:
+                    # No price yet, skip this symbol
+                    continue
+
+                # Calculate coin imbalance (NOT level imbalance!)
+                long_qty = pm.get_total_quantity('Buy')
+                short_qty = pm.get_total_quantity('Sell')
+                coin_imbalance = abs(long_qty - short_qty)
+
+                # Convert to USD: imbalance × price
+                imbalance_usd = coin_imbalance * current_price
+
+                # Add to total reserve
+                total_reserve += imbalance_usd
+
+                # Collect ATR for this symbol
+                atr_percent = strategy.calculate_atr_percent()
+                atr_values.append(atr_percent)
+
+            except Exception as e:
+                self.logger.error(f"[{symbol}] Error calculating reserve: {e}")
+                # Continue with other symbols
+
+        # Use worst-case (maximum) ATR for safety factor
+        # This ensures we're protected against the most volatile symbol
+        max_atr_percent = max(atr_values) if atr_values else 1.5
+
+        # Calculate dynamic safety factor
+        safety_factor = self.calculate_safety_factor(max_atr_percent)
+
+        # Apply safety factor
+        final_reserve = total_reserve * safety_factor
+
+        # Log detailed info (debug level to avoid spam)
+        self.logger.debug(
+            f"[Account {self.id_str}] Safety reserve: "
+            f"base=${total_reserve:.2f}, ATR={max_atr_percent:.2f}%, "
+            f"factor={safety_factor:.2f}, final=${final_reserve:.2f}"
+        )
+
+        return final_reserve
+
+    def monitor_initial_margin(self) -> Dict[str, float]:
+        """
+        Monitor Initial Margin and Available Balance with detailed metrics (Phase 6: Advanced Risk Management)
+
+        Returns comprehensive metrics for IM monitoring and logging.
+
+        Returns:
+            Dictionary with keys:
+            - total_balance: totalAvailableBalance from exchange
+            - total_initial_margin: total IM used across all positions
+            - total_maintenance_margin: total MM across all positions
+            - account_mm_rate: account-level MM Rate percentage
+            - safety_reserve: dynamic safety reserve for rebalancing
+            - available_for_trading: balance available after IM and reserve
+            - available_percent: percentage of balance available
+        """
+        metrics = {}
+
+        try:
+            # Get balance manager from first strategy (shared across all symbols)
+            balance_manager = None
+            for strategy in self.strategies.values():
+                balance_manager = strategy.balance_manager
+                break
+
+            if not balance_manager:
+                self.logger.warning(f"[Account {self.id_str}] No balance manager available for IM monitoring")
+                return {}
+
+            # Get all balance fields from BalanceManager (uses WebSocket cache)
+            metrics['total_balance'] = balance_manager.get_available_balance()
+            metrics['total_initial_margin'] = balance_manager.get_initial_margin() or 0.0
+            metrics['total_maintenance_margin'] = balance_manager.get_maintenance_margin() or 0.0
+            mm_rate = balance_manager.get_mm_rate()
+            metrics['account_mm_rate'] = mm_rate if mm_rate is not None else 0.0
+
+            # Calculate safety reserve (dynamic based on ATR)
+            metrics['safety_reserve'] = self.calculate_account_safety_reserve()
+
+            # Calculate available for trading
+            # Note: totalAvailableBalance already has IM subtracted by Bybit
+            # So we only subtract our safety reserve
+            metrics['available_for_trading'] = metrics['total_balance'] - metrics['safety_reserve']
+
+            # Calculate percentage
+            if metrics['total_balance'] > 0:
+                # Calculate true available as percentage of (balance + IM)
+                # This gives more intuitive percentage (how much of total equity is available)
+                total_equity = metrics['total_balance'] + metrics['total_initial_margin']
+                metrics['available_percent'] = (metrics['available_for_trading'] / total_equity) * 100
+            else:
+                metrics['available_percent'] = 0.0
+
+            return metrics
+
+        except Exception as e:
+            self.logger.error(f"[Account {self.id_str}] Error monitoring Initial Margin: {e}")
+            return {}
+
+    def log_im_status(self) -> None:
+        """
+        Log Initial Margin status with appropriate warning levels (Phase 6: Advanced Risk Management)
+
+        Log levels:
+        - INFO: periodic logging (every 60s via process_price)
+        - WARNING: available_percent < 30%
+        - ERROR: available_percent < 15%
+        - CRITICAL: available_for_trading < 0 (reserve breached!)
+        """
+        metrics = self.monitor_initial_margin()
+
+        if not metrics:
+            return
+
+        # Extract values
+        total_balance = metrics.get('total_balance', 0.0)
+        total_im = metrics.get('total_initial_margin', 0.0)
+        safety_reserve = metrics.get('safety_reserve', 0.0)
+        available = metrics.get('available_for_trading', 0.0)
+        available_pct = metrics.get('available_percent', 0.0)
+        mm_rate = metrics.get('account_mm_rate', 0.0)
+
+        # Build log message
+        log_msg = (
+            f"[Account {self.id_str}] IM Status: "
+            f"balance=${total_balance:.2f}, "
+            f"used_IM=${total_im:.2f}, "
+            f"reserve=${safety_reserve:.2f}, "
+            f"available=${available:.2f} ({available_pct:.1f}%), "
+            f"MM_Rate={mm_rate:.2f}%"
+        )
+
+        # Determine log level based on available percentage and absolute value
+        if available < 0:
+            # CRITICAL: Reserve breached!
+            self.logger.critical(f"🚨 {log_msg} - SAFETY RESERVE BREACHED!")
+        elif available_pct < 15:
+            # ERROR: Very low available margin
+            self.logger.error(f"❌ {log_msg} - CRITICALLY LOW AVAILABLE MARGIN")
+        elif available_pct < 30:
+            # WARNING: Low available margin
+            self.logger.warning(f"⚠️  {log_msg} - LOW AVAILABLE MARGIN")
+        else:
+            # INFO: Normal status (log only periodically, handled by caller)
+            self.logger.info(log_msg)
+
+    def check_reserve_before_averaging(
+        self,
+        symbol: str,
+        side: str,
+        next_averaging_margin: float
+    ) -> bool:
+        """
+        Check if there's sufficient reserve before averaging (CRITICAL FUNCTION!)
+
+        Executes at ACCOUNT level before averaging ANY symbol.
+        Accounts for imbalances across ALL symbols.
+
+        This is the core protection mechanism that prevents the bot from
+        entering a state where it cannot rebalance positions.
+
+        Also checks Early Freeze state - if frozen, blocks averaging.
+
+        Args:
+            symbol: Symbol that wants to average (e.g., 'DOGEUSDT')
+            side: Side of averaging ('Buy' or 'Sell')
+            next_averaging_margin: Margin required for next averaging
+
+        Returns:
+            True if averaging can proceed safely, False if blocked
+        """
+        # Use account lock to ensure atomic check-then-act
+        with self._account_lock:
+            # Check Early Freeze first (Phase 2: Advanced Risk Management)
+            if self.averaging_frozen:
+                # Throttled logging to avoid spam
+                self.logger.debug(
+                    f"[{symbol}] Averaging BLOCKED by Early Freeze. "
+                    f"Reason: {self.freeze_reason}"
+                )
+                return False
+
+            try:
+                # 1. Get current data from Wallet WebSocket cache (real-time, no REST API!)
+                total_balance = self.balance_manager.get_available_balance()
+                total_im = self.balance_manager.get_initial_margin()
+
+                # 2. Calculate dynamic safety reserve for ALL symbols
+                safety_reserve = self.calculate_account_safety_reserve()
+
+                # 3. Calculate available funds (WITHOUT double IM subtraction!)
+                # totalAvailableBalance already has IM subtracted by Bybit
+                available_for_trading = total_balance - safety_reserve
+
+                # 4. Check if we have enough
+                if available_for_trading >= next_averaging_margin:
+                    self.logger.info(
+                        f"[{symbol}] Reserve check PASSED: "
+                        f"available=${available_for_trading:.2f}, "
+                        f"needed=${next_averaging_margin:.2f}, "
+                        f"reserve=${safety_reserve:.2f} (all symbols)"
+                    )
+                    return True
+                else:
+                    self.logger.warning(
+                        f"[{symbol}] Reserve check FAILED: "
+                        f"available=${available_for_trading:.2f}, "
+                        f"needed=${next_averaging_margin:.2f}, "
+                        f"reserve=${safety_reserve:.2f} (all symbols). "
+                        f"BLOCKING averaging to preserve emergency funds!"
+                    )
+                    return False
+
+            except Exception as e:
+                self.logger.error(
+                    f"[{symbol}] Error in reserve check: {e}. "
+                    f"BLOCKING averaging for safety!"
+                )
+                return False  # Fail-safe: block on error
+
+    def check_early_freeze_trigger(self) -> tuple[bool, str]:
+        """
+        Check if Early Freeze should be activated (Phase 2: Advanced Risk Management)
+
+        Early Freeze blocks averaging BEFORE panic mode, preserving safety reserve.
+        Triggered when available IM is insufficient for comfortable operation.
+
+        Returns:
+            (should_freeze: bool, reason: str)
+        """
+        try:
+            # 1. Get current data from Wallet WebSocket cache
+            total_balance = self.balance_manager.get_available_balance()
+            safety_reserve = self.calculate_account_safety_reserve()
+            available_for_trading = total_balance - safety_reserve
+
+            # 2. Calculate worst-case next averaging (if ALL symbols average simultaneously)
+            next_margins = []
+            for strategy in self.strategies.values():
+                for side in ['Buy', 'Sell']:
+                    try:
+                        # Calculate next margin for this side
+                        positions = strategy.pm.long_positions if side == 'Buy' else strategy.pm.short_positions
+                        if positions:
+                            last_position = positions[-1]
+                            last_position_value = last_position.quantity * strategy.current_price
+                            last_position_margin = last_position_value / strategy.leverage
+                            next_margin = last_position_margin * strategy.multiplier
+                        else:
+                            next_margin = strategy.initial_size_usd
+
+                        next_margins.append(next_margin)
+                    except Exception as e:
+                        self.logger.debug(f"Error calculating next margin for {strategy.symbol} {side}: {e}")
+                        continue
+
+            if not next_margins:
+                # No positions tracked yet, no freeze needed
+                return (False, "")
+
+            next_worst_case = sum(next_margins)
+
+            # 3. Comfort threshold: need 1.5× next_worst_case for comfortable operation
+            # This gives buffer for unexpected tier upgrades and price movements
+            comfort_threshold = next_worst_case * 1.5
+
+            # 4. Check trigger
+            if available_for_trading < comfort_threshold:
+                reason = (
+                    f"EARLY_FREEZE: available=${available_for_trading:.2f} < "
+                    f"comfort_threshold=${comfort_threshold:.2f} "
+                    f"(next_worst_case=${next_worst_case:.2f} × 1.5)"
+                )
+                return (True, reason)
+
+            return (False, "")
+
+        except Exception as e:
+            self.logger.error(f"Error checking Early Freeze trigger: {e}")
+            return (False, "")  # Don't freeze on error
+
+    def freeze_all_averaging(self, reason: str):
+        """
+        Freeze all averaging operations across ALL symbols (Phase 2: Early Freeze)
+
+        Args:
+            reason: Reason for freezing
+        """
+        if not self.averaging_frozen:
+            self.averaging_frozen = True
+            self.freeze_reason = reason
+            self.logger.warning(
+                f"⚠️ EARLY FREEZE ACTIVATED: Blocking all averaging operations. "
+                f"Reason: {reason}. "
+                f"TP orders continue to work normally."
+            )
+
+    def unfreeze_all_averaging(self):
+        """
+        Unfreeze averaging operations when conditions recover (Phase 2: Early Freeze)
+        """
+        if self.averaging_frozen:
+            self.averaging_frozen = False
+            old_reason = self.freeze_reason
+            self.freeze_reason = None
+            self.logger.info(
+                f"✅ EARLY FREEZE DEACTIVATED: Available IM recovered. "
+                f"Resuming averaging operations. "
+                f"Previous reason: {old_reason}"
+            )
+
+    def check_panic_trigger_low_im(self) -> tuple[bool, str]:
+        """
+        Check Panic Mode trigger: LOW Available IM (Phase 3: Advanced Risk Management)
+
+        This is the PRIMARY panic trigger. Activates when available IM is
+        insufficient to continue operations safely (< 3× next worst case).
+
+        Returns:
+            (triggered: bool, reason: str)
+        """
+        try:
+            # Get metrics
+            total_balance = self.balance_manager.get_available_balance()
+            safety_reserve = self.calculate_account_safety_reserve()
+            available_for_trading = total_balance - safety_reserve
+
+            # Calculate next averaging worst case (if ALL symbols average)
+            next_margins = []
+            for strategy in self.strategies.values():
+                for side in ['Buy', 'Sell']:
+                    try:
+                        positions = strategy.pm.long_positions if side == 'Buy' else strategy.pm.short_positions
+                        if positions:
+                            last_position = positions[-1]
+                            last_position_value = last_position.quantity * strategy.current_price
+                            last_position_margin = last_position_value / strategy.leverage
+                            next_margin = last_position_margin * strategy.multiplier
+                        else:
+                            next_margin = strategy.initial_size_usd
+                        next_margins.append(next_margin)
+                    except:
+                        continue
+
+            if not next_margins:
+                return (False, "")
+
+            next_worst_case = sum(next_margins)
+
+            # Panic threshold: available < next_worst_case × 3
+            # More severe than Early Freeze (which uses 1.5×)
+            panic_threshold = next_worst_case * 3
+
+            if available_for_trading < panic_threshold:
+                reason = (
+                    f"LOW_IM: available=${available_for_trading:.2f} < "
+                    f"panic_threshold=${panic_threshold:.2f} "
+                    f"(next_worst_case=${next_worst_case:.2f} × 3)"
+                )
+                return (True, reason)
+
+            return (False, "")
+
+        except Exception as e:
+            self.logger.error(f"Error checking LOW_IM panic trigger: {e}")
+            return (False, "")
+
+    def check_panic_trigger_high_imbalance(self) -> tuple[bool, str]:
+        """
+        Check Panic Mode trigger: HIGH Imbalance + Low IM (Phase 3: Advanced Risk Management)
+
+        Secondary trigger for situations where one side is heavily averaged
+        while IM is constrained.
+
+        Trigger: max_imbalance_ratio > 10× AND available_percent < 30%
+
+        Returns:
+            (triggered: bool, reason: str)
+        """
+        try:
+            # Get metrics
+            total_balance = self.balance_manager.get_available_balance()
+            total_im = self.balance_manager.get_initial_margin()
+            safety_reserve = self.calculate_account_safety_reserve()
+            available_for_trading = total_balance - safety_reserve
+
+            # Calculate available percentage
+            if total_balance > 0:
+                available_percent = (available_for_trading / total_balance) * 100
+            else:
+                return (False, "")
+
+            # Find maximum imbalance ratio across all symbols
+            max_imbalance_ratio = 0
+            max_imbalance_symbol = None
+
+            for symbol, strategy in self.strategies.items():
+                try:
+                    pm = strategy.pm
+                    long_margin = 0
+                    short_margin = 0
+
+                    # Calculate MARGIN for each side (not qty!)
+                    for pos in pm.long_positions:
+                        pos_value = pos.quantity * strategy.current_price
+                        long_margin += pos_value / strategy.leverage
+
+                    for pos in pm.short_positions:
+                        pos_value = pos.quantity * strategy.current_price
+                        short_margin += pos_value / strategy.leverage
+
+                    # Calculate ratio (larger / smaller)
+                    if long_margin > 0 and short_margin > 0:
+                        ratio = max(long_margin, short_margin) / min(long_margin, short_margin)
+                        if ratio > max_imbalance_ratio:
+                            max_imbalance_ratio = ratio
+                            max_imbalance_symbol = symbol
+
+                except:
+                    continue
+
+            # Check trigger: high imbalance + low available
+            if max_imbalance_ratio > 10 and available_percent < 30:
+                reason = (
+                    f"HIGH_IMBALANCE: max_ratio={max_imbalance_ratio:.1f}× "
+                    f"(symbol={max_imbalance_symbol}) AND "
+                    f"available={available_percent:.1f}% < 30%"
+                )
+                return (True, reason)
+
+            return (False, "")
+
+        except Exception as e:
+            self.logger.error(f"Error checking HIGH_IMBALANCE panic trigger: {e}")
+            return (False, "")
+
+    def balance_all_positions_adaptive(self) -> bool:
+        """
+        Balance all positions adaptively across all symbols (Phase 7: Advanced Risk Management)
+
+        In panic mode, attempt to balance LONG and SHORT positions to reduce risk.
+        Uses ALL available balance (ignores safety reserve in panic state).
+
+        Strategy:
+        - Full balancing: if available >= total_needed, balance all symbols 100%
+        - Partial balancing: if 0 < available < total_needed, proportional distribution
+        - Critical state: if available ≈ 0, log and skip (insufficient funds)
+
+        Returns:
+            True if balancing was attempted (full or partial), False if skipped
+        """
+        try:
+            # Collect imbalance information from ALL symbols
+            imbalances = []
+
+            for symbol, strategy in self.strategies.items():
+                pm = strategy.pm
+                current_price = strategy.current_price
+
+                if current_price <= 0:
+                    continue
+
+                long_qty = pm.get_total_quantity('Buy')
+                short_qty = pm.get_total_quantity('Sell')
+                imbalance_qty = abs(long_qty - short_qty)
+
+                if imbalance_qty < 0.001:
+                    # Already balanced
+                    continue
+
+                # Determine lagging side
+                lagging_side = 'Buy' if long_qty < short_qty else 'Sell'
+
+                # Calculate margin needed to balance
+                # We need to buy enough on lagging side to match the other side
+                qty_to_buy = imbalance_qty
+                position_value_needed = qty_to_buy * current_price
+                margin_needed = position_value_needed / strategy.leverage
+
+                imbalances.append({
+                    'symbol': symbol,
+                    'lagging_side': lagging_side,
+                    'qty_to_buy': qty_to_buy,
+                    'margin_needed': margin_needed,
+                    'current_price': current_price,
+                    'strategy': strategy
+                })
+
+            if not imbalances:
+                self.logger.info(
+                    f"[Account {self.id_str}] All symbols already balanced, no action needed"
+                )
+                return False
+
+            # Calculate total margin needed
+            total_margin_needed = sum(item['margin_needed'] for item in imbalances)
+
+            # Get available balance (in PANIC mode, we use ALL available, ignore safety reserve!)
+            balance_manager = None
+            for strategy in self.strategies.values():
+                balance_manager = strategy.balance_manager
+                break
+
+            if not balance_manager:
+                self.logger.error(f"[Account {self.id_str}] No balance manager for position balancing")
+                return False
+
+            available = balance_manager.get_available_balance()
+
+            self.logger.info(
+                f"[Account {self.id_str}] Position balancing: "
+                f"need ${total_margin_needed:.2f}, available ${available:.2f}"
+            )
+
+            # Determine balancing strategy
+            if available < 1.0:
+                # CRITICAL: Insufficient funds
+                self.logger.critical(
+                    f"🚨 [Account {self.id_str}] CRITICAL STATE: "
+                    f"Cannot balance positions - available ${available:.2f} < $1.00"
+                )
+                return False
+
+            elif available >= total_margin_needed:
+                # FULL BALANCING: Enough funds to balance everything
+                scale_factor = 1.0
+                self.logger.info(
+                    f"💯 [Account {self.id_str}] FULL BALANCING: "
+                    f"available ${available:.2f} >= needed ${total_margin_needed:.2f}"
+                )
+
+            else:
+                # PARTIAL BALANCING: Proportional distribution
+                scale_factor = available / total_margin_needed
+                self.logger.warning(
+                    f"⚠️  [Account {self.id_str}] PARTIAL BALANCING: "
+                    f"available ${available:.2f} < needed ${total_margin_needed:.2f}, "
+                    f"scale_factor={scale_factor:.2%}"
+                )
+
+            # Execute balancing orders
+            for item in imbalances:
+                symbol = item['symbol']
+                lagging_side = item['lagging_side']
+                qty_to_buy = item['qty_to_buy'] * scale_factor  # Scale down if partial
+                margin_used = item['margin_needed'] * scale_factor
+                strategy = item['strategy']
+
+                self.logger.info(
+                    f"🔧 [{symbol}] PANIC BALANCE: {lagging_side} {qty_to_buy:.6f} @ ${item['current_price']:.4f} "
+                    f"(margin ${margin_used:.2f})"
+                )
+
+                if not self.dry_run:
+                    try:
+                        # Place market order on lagging side
+                        response = strategy.client.place_order(
+                            symbol=symbol,
+                            side=lagging_side,
+                            qty=qty_to_buy,
+                            order_type="Market",
+                            category=strategy.category
+                        )
+
+                        # Update position manager
+                        pm = strategy.pm
+                        pm.add_position(
+                            side=lagging_side,
+                            entry_price=item['current_price'],
+                            quantity=qty_to_buy,
+                            grid_level=pm.get_position_count(lagging_side)  # Current level
+                        )
+
+                        # Update TP order
+                        strategy._update_tp_order(lagging_side)
+
+                        # Log to metrics
+                        if strategy.metrics_tracker:
+                            strategy.metrics_tracker.log_trade(
+                                symbol=symbol,
+                                side=lagging_side,
+                                action="BALANCE",
+                                price=item['current_price'],
+                                quantity=qty_to_buy,
+                                reason=f"Panic balance (scale={scale_factor:.2%})",
+                                pnl=None
+                            )
+
+                        self.logger.info(f"✅ [{symbol}] Balance order executed successfully")
+
+                    except Exception as e:
+                        self.logger.error(f"❌ [{symbol}] Failed to execute balance order: {e}")
+                        # Continue with other symbols
+
+            self.logger.info(
+                f"🎯 [Account {self.id_str}] Position balancing completed "
+                f"({len(imbalances)} symbols, scale={scale_factor:.2%})"
+            )
+            return True
+
+        except Exception as e:
+            self.logger.error(
+                f"[Account {self.id_str}] Error in balance_all_positions_adaptive: {e}",
+                exc_info=True
+            )
+            return False
+
+    def enter_panic_mode(self, reason: str):
+        """
+        Enter Panic Mode (Phase 3: Advanced Risk Management)
+
+        Critical state triggered when IM is severely constrained.
+
+        Actions:
+        1. Freeze all averaging operations
+        2. Cancel TP orders intelligently (trend side only)
+        3. Attempt to balance positions adaptively (use ALL available)
+
+        Args:
+            reason: Reason for entering panic mode
+        """
+        if not self.panic_mode:
+            self.panic_mode = True
+            self.panic_reason = reason
+            self.panic_entered_at = time.time()
+
+            self.logger.error(
+                f"🔴 PANIC MODE ACTIVATED! "
+                f"Reason: {reason}. "
+                f"Freezing averaging, canceling TPs intelligently, attempting position balancing."
+            )
+
+            # 1. Freeze all averaging (if not already frozen)
+            if not self.averaging_frozen:
+                self.freeze_all_averaging(f"PANIC: {reason}")
+
+            # 2. Cancel TP orders intelligently (Phase 4: Intelligent TP Management)
+            self.cancel_tp_intelligently()
+
+            # 3. Attempt to balance positions adaptively (Phase 7: Advanced Risk Management)
+            balancing_attempted = self.balance_all_positions_adaptive()
+            if balancing_attempted:
+                self.logger.info(
+                    f"[Account {self.id_str}] Position balancing executed during panic mode entry"
+                )
+            else:
+                self.logger.warning(
+                    f"[Account {self.id_str}] Position balancing skipped (already balanced or insufficient funds)"
+                )
+
+    def exit_panic_mode(self, reason: str):
+        """
+        Exit Panic Mode (Phase 3: Advanced Risk Management)
+
+        Conditions recovered, resume normal operations.
+
+        Actions:
+        1. Unfreeze averaging (if Early Freeze is also cleared)
+        2. Restore TP orders for all positions
+
+        Args:
+            reason: Reason for exiting panic mode
+        """
+        if self.panic_mode:
+            self.panic_mode = False
+            old_reason = self.panic_reason
+            self.panic_reason = None
+            duration = time.time() - self.panic_entered_at if self.panic_entered_at else 0
+            self.panic_entered_at = None
+
+            self.logger.info(
+                f"🟢 PANIC MODE DEACTIVATED! "
+                f"Reason: {reason}. "
+                f"Duration: {duration:.1f}s. "
+                f"Previous reason: {old_reason}. "
+                f"Resuming normal operations."
+            )
+
+            # Unfreeze averaging only if Early Freeze is also cleared
+            # (Early Freeze check in process_price will handle automatic unfreeze)
+            # For now, just log
+            self.logger.info("Averaging will resume when Early Freeze clears")
+
+            # Restore TP orders for all positions (Phase 4: Advanced Risk Management)
+            self._restore_tp_orders_after_panic()
+
+    def cancel_tp_intelligently(self):
+        """
+        Cancel TP orders intelligently during Panic Mode (Phase 4: Advanced Risk Management)
+
+        Strategy: Remove TP from TREND side (not losing side!), keep TP on COUNTER-TREND.
+
+        Why: If market reverses, counter-trend side will hit TP = natural exit from panic!
+        """
+        for symbol, strategy in self.strategies.items():
+            try:
+                # Determine trend direction based on grid levels
+                trend_side, counter_side, trend_direction = strategy.determine_trend_side()
+
+                self.logger.info(
+                    f"[{symbol}] Detected trend: {trend_direction} "
+                    f"(trend_side={trend_side} level={strategy.pm.get_position_count(trend_side)}, "
+                    f"counter={counter_side} level={strategy.pm.get_position_count(counter_side)})"
+                )
+
+                # Get TP order IDs for both sides
+                trend_tp_id = strategy.pm.get_tp_order_id(trend_side)
+                counter_tp_id = strategy.pm.get_tp_order_id(counter_side)
+
+                # Cancel TP on TREND side (let it continue growing if trend continues)
+                if trend_tp_id and not strategy.dry_run:
+                    try:
+                        strategy.client.cancel_order(
+                            symbol=symbol,
+                            order_id=trend_tp_id,
+                            category=strategy.category
+                        )
+                        # Clear from position manager tracking
+                        strategy.pm.set_tp_order_id(trend_side, None)
+                        self.logger.info(
+                            f"✅ [{symbol}] Removed TP on TREND side ({trend_side}): "
+                            f"allow further growth"
+                        )
+                    except Exception as e:
+                        self.logger.warning(
+                            f"[{symbol}] Failed to cancel TP on {trend_side}: {e}"
+                        )
+
+                # KEEP TP on COUNTER-TREND side (natural exit if reversal!)
+                if counter_tp_id:
+                    self.logger.info(
+                        f"✅ [{symbol}] KEEPING TP on COUNTER-TREND side ({counter_side}): "
+                        f"waiting for reversal (natural exit)"
+                    )
+
+                # Log strategy
+                self.logger.info(
+                    f"[{symbol}] TP Strategy: "
+                    f"If trend reverses → {counter_side} hits TP → natural exit ✅ | "
+                    f"If trend continues → wait for stabilization"
+                )
+
+            except Exception as e:
+                self.logger.error(f"[{symbol}] Error in cancel_tp_intelligently: {e}")
+                continue
+
+    def _restore_tp_orders_after_panic(self):
+        """
+        Restore TP orders for all positions after exiting Panic Mode (Phase 4: Advanced Risk Management)
+
+        This method is called when panic mode is deactivated. It ensures that all open
+        positions have their TP orders restored, particularly the TREND side TP that
+        was cancelled during panic entry.
+
+        Strategy:
+        - Check all symbols and all sides
+        - If positions exist but no TP order → create TP order
+        - Skip if no positions or TP already exists
+        """
+        self.logger.info(f"[Account {self.id_str}] Restoring TP orders after panic mode exit...")
+
+        restored_count = 0
+        for symbol, strategy in self.strategies.items():
+            try:
+                for side in ['Buy', 'Sell']:
+                    # Check if this side has positions
+                    positions = strategy.pm.long_positions if side == 'Buy' else strategy.pm.short_positions
+
+                    if not positions:
+                        # No positions on this side, skip
+                        continue
+
+                    # Check if TP order already exists
+                    existing_tp_id = strategy.pm.get_tp_order_id(side)
+
+                    if existing_tp_id:
+                        # TP order already exists (e.g., counter-trend side that wasn't cancelled)
+                        self.logger.debug(
+                            f"[{symbol}] {side} already has TP order (ID: {existing_tp_id}), skipping"
+                        )
+                        continue
+
+                    # Restore TP order
+                    if not self.dry_run:
+                        try:
+                            strategy._update_tp_order(side)
+                            restored_count += 1
+                            self.logger.info(
+                                f"✅ [{symbol}] Restored TP order for {side} side "
+                                f"({len(positions)} positions)"
+                            )
+                        except Exception as e:
+                            self.logger.error(
+                                f"❌ [{symbol}] Failed to restore TP order for {side}: {e}"
+                            )
+                    else:
+                        # Dry run mode
+                        self.logger.info(
+                            f"✅ [{symbol}] [DRY RUN] Would restore TP order for {side} side"
+                        )
+                        restored_count += 1
+
+            except Exception as e:
+                self.logger.error(f"[{symbol}] Error restoring TP orders: {e}")
+                continue
+
+        if restored_count > 0:
+            self.logger.info(
+                f"🎯 [Account {self.id_str}] TP restoration completed: "
+                f"{restored_count} TP orders restored"
+            )
+        else:
+            self.logger.info(
+                f"[Account {self.id_str}] No TP orders needed restoration "
+                f"(all positions already have TP orders)"
+            )
 
     def is_stopped(self) -> bool:
         """

@@ -7,6 +7,158 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0] - 2025-10-13
+
+### Added - Advanced Risk Management System v3.1
+
+This release introduces a comprehensive, multi-layered risk management system that provides intelligent protection mechanisms beyond simple MM Rate monitoring. The system uses dynamic calculations, preventive measures, and adaptive strategies to protect account equity during high-risk trading scenarios.
+
+#### Phase 1: Dynamic Safety Factor Based on ATR
+- **`GridStrategy.calculate_atr_percent()`** - Calculates Average True Range as percentage with 60s caching
+- **`TradingAccount.calculate_safety_factor()`** - Dynamic safety factor (1.17-1.25) based on market volatility:
+  - Low volatility (ATR < 1.0%): factor = 1.17 (base + 2% gap + tier)
+  - Medium volatility (1.0-2.0%): factor = 1.20 (base + 5% gap + tier)
+  - High volatility (> 2.0%): factor = 1.25 (base + 10% gap + tier)
+- **Updated `calculate_account_safety_reserve()`** - Now uses worst-case (max) ATR across all symbols
+
+#### Phase 2: Early Freeze Mechanism
+- **Preventive averaging block** triggers when `available < next_worst_case × 1.5`
+- **`check_early_freeze_trigger()`** - Monitors available margin vs upcoming averaging needs across ALL symbols
+- **`freeze_all_averaging()` / `unfreeze_all_averaging()`** - Account-level averaging control
+- **Automatic recovery** - Unfreezes when conditions improve (if not in panic)
+- **TP orders continue working** during freeze, allowing natural exits
+- Integrated into `check_reserve_before_averaging()` - blocks averaging when frozen
+
+#### Phase 3: Panic Mode Implementation
+- **Critical state activation** when:
+  - PRIMARY: `available < next_worst_case × 3` (LOW_IM trigger)
+  - SECONDARY: `imbalance_ratio > 10 AND available < 30%` (HIGH_IMBALANCE trigger)
+- **`check_panic_trigger_low_im()` / `check_panic_trigger_high_imbalance()`** - Dual panic triggers
+- **`enter_panic_mode()` / `exit_panic_mode()`** - Panic state management with timestamps
+- **Integrated actions on panic entry**:
+  1. Freeze all averaging (via Early Freeze)
+  2. Cancel TP orders intelligently (trend side only - Phase 4)
+  3. Attempt adaptive position balancing (Phase 7)
+- **Natural exit** - Via counter-trend TP closure → IM recovers → Early Freeze clears → panic triggers stop firing
+
+#### Phase 4: Intelligent TP Management
+- **`GridStrategy.determine_trend_side()`** - Identifies trend based on grid levels (side that averaged MORE)
+- **`TradingAccount.cancel_tp_intelligently()`** - Removes TP from TREND side, keeps counter-trend TP
+- **`TradingAccount._restore_tp_orders_after_panic()`** - Restores TP orders when exiting panic mode
+- **Smart reasoning**:
+  - Trend side = side that averaged more (price moved against it)
+  - Counter-trend side = side that averaged less (closer to profit)
+  - Keeping counter-trend TP provides natural panic exit without forcing close
+- Integrated into `enter_panic_mode()` - executes after freezing averaging
+- Integrated into `exit_panic_mode()` - restores all TP orders after panic recovery
+
+#### Phase 5: Adaptive Reopen by Margin Ratio
+- **`GridStrategy.get_total_margin(side)`** - Calculates total margin used by position side
+- **`GridStrategy.calculate_reopen_size()`** - Adapts reopen size based on margin imbalance:
+  - `ratio ≥ 16` → 100% of opposite margin (large imbalance)
+  - `ratio ≥ 8` → 50% (medium)
+  - `ratio ≥ 4` → 25% (moderate)
+  - `ratio < 4` → initial size (small)
+- **Updated `_open_initial_position()`** - Accepts optional `custom_margin_usd` parameter for backward compatibility
+- **Integrated into WebSocket callbacks**:
+  - `on_execution()` - When execution stream detects position close
+  - `on_position_update()` - When position stream reports size < 0.001
+- **Logs "ADAPTIVE REOPEN"** with margin amount to metrics tracker
+- **Uses margin ratio** (adapts to price changes) instead of level_diff (static)
+
+#### Phase 6: Dynamic IM Monitoring
+- **`TradingAccount.monitor_initial_margin()`** - Returns comprehensive metrics dict:
+  - `total_balance` - totalAvailableBalance from exchange
+  - `total_initial_margin` - Total IM used across all positions
+  - `total_maintenance_margin` - Total MM across all positions
+  - `account_mm_rate` - Account-level MM Rate percentage
+  - `safety_reserve` - Dynamic safety reserve for rebalancing
+  - `available_for_trading` - Balance available after IM and reserve
+  - `available_percent` - Percentage of equity available
+- **`TradingAccount.log_im_status()`** - Intelligent logging with warning levels:
+  - INFO: Periodic status (every 60s in `process_price()`)
+  - WARNING: available < 30% (yellow flag)
+  - ERROR: available < 15% (red flag)
+  - CRITICAL: available < 0 (reserve breached!)
+- **Integrated into `process_price()`** - Account-level logging once per 60s (not per symbol)
+- **Uses WebSocket-cached data** from BalanceManager (zero REST API calls)
+
+#### Phase 7: Position Balancing in Panic Mode
+- **`TradingAccount.balance_all_positions_adaptive()`** - Multi-symbol position balancing:
+  - Collects imbalance info from ALL symbols (long_qty, short_qty, lagging_side, margin_needed)
+  - Calculates total_margin_needed across all symbols
+  - **Three balancing strategies**:
+    - **Full balancing**: `available ≥ total_needed` → balance all symbols 100%
+    - **Partial balancing**: `0 < available < total_needed` → proportional distribution (scale_factor)
+    - **Critical state**: `available < $1.00` → skip balancing, log critical
+- **Uses ALL available margin** in panic (ignores safety reserve - desperate state)
+- **Executes market orders** on lagging side to balance LONG/SHORT
+- **Updates position manager** and creates TP orders after balancing
+- **Logs "BALANCE" action** to metrics tracker with scale factor
+- **Integrated into `enter_panic_mode()`** - Executes after intelligent TP cancellation
+- **Returns bool** indicating if balancing was attempted
+
+### Changed
+- **Safety reserve calculation** now dynamic based on ATR (was static 1.20 multiplier)
+- **Reserve checking** now accounts for Early Freeze state (blocks if frozen)
+- **Position reopening** now adaptive based on margin ratio (was always initial size)
+- **IM monitoring** moved from manual calculation to centralized `monitor_initial_margin()` method
+- **Panic mode handling** now includes position balancing and intelligent TP management
+
+### Technical Details
+
+**Thread Safety:**
+- All account-level operations use `_account_lock` to prevent race conditions
+- Balance manager updates are atomic
+- Position manager operations are thread-safe
+
+**WebSocket-First Architecture:**
+- All balance/IM data from Wallet WebSocket (zero REST API calls after startup)
+- BalanceManager caches with 5s TTL
+- Real-time updates without polling
+
+**Hierarchical Protection:**
+- **Early Freeze** (preventive) - `available < next × 1.5`
+- **Panic Mode** (critical) - `available < next × 3` OR `ratio > 10 AND available < 30%`
+- **Emergency Close** (catastrophic) - `MM Rate ≥ threshold` (default 90%)
+
+**Fail-Safe Design:**
+- Block averaging on errors
+- No defaults for critical data
+- Force refresh only when necessary
+- Validate all inputs
+
+### Testing
+- **172 existing tests pass** - Zero regressions ✅
+- **28 new tests added** for Advanced Risk Management features
+  - Phase 1: ATR calculation and safety factor tests
+  - Phase 2: Early Freeze trigger and behavior tests
+  - Phase 3: Panic Mode activation and workflow tests
+  - Phase 4: Intelligent TP and trend detection tests (including TP restoration after panic exit)
+  - Phase 5: Adaptive reopen and margin ratio tests
+  - Phase 6: IM monitoring and warning threshold tests
+  - Phase 7: Position balancing strategies tests
+  - Integration: Full workflow tests
+- Comprehensive coverage of all new features
+
+### Performance
+- **ATR caching** - 60s TTL reduces recalculation overhead
+- **BalanceManager caching** - 5s TTL eliminates redundant API calls
+- **Efficient WebSocket updates** - Real-time data without polling
+- **Minimal computational overhead** - Dynamic calculations only when needed
+
+### Documentation
+- Created `docs/IMPLEMENTATION_TODO.md` with full implementation tracking
+- All methods documented with comprehensive docstrings
+- Added inline comments explaining complex logic
+- Updated CLAUDE.md with new risk management features (Phase 9)
+
+### Breaking Changes
+**None** - All changes are backward compatible. Existing configurations will continue to work without modification.
+
+### Migration Notes
+**No action required** - Bot automatically uses new risk management system. Optional: adjust `mm_rate_threshold` in config.yaml per account if desired (default: 90%).
+
 ## [1.5.0] - 2025-01-15
 
 ### Changed - REST API Optimization (WebSocket-First Architecture)

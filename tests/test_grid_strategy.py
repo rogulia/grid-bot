@@ -581,10 +581,12 @@ class TestOnWalletUpdate:
 
         # Should call balance_manager.update_from_websocket with converted values
         balance_manager.update_from_websocket.assert_called_once()
-        call_args = balance_manager.update_from_websocket.call_args[0]
+        call_kwargs = balance_manager.update_from_websocket.call_args[1]
 
-        assert call_args[0] == pytest.approx(1234.56)  # Balance
-        assert call_args[1] == pytest.approx(0.15)     # MM Rate in percentage
+        assert call_kwargs['balance'] == pytest.approx(1234.56)  # Balance
+        assert call_kwargs['mm_rate'] == pytest.approx(0.15)     # MM Rate in percentage
+        assert call_kwargs['initial_margin'] is None             # Not in test data
+        assert call_kwargs['maintenance_margin'] is None         # Not in test data
 
     def test_mm_rate_update(self, grid_strategy):
         """Test that MM Rate is correctly converted from decimal to percentage"""
@@ -601,8 +603,9 @@ class TestOnWalletUpdate:
         grid_strategy.on_wallet_update(wallet_data)
 
         # Check MM Rate conversion (decimal * 100 = percentage)
-        call_args = balance_manager.update_from_websocket.call_args[0]
-        assert call_args[1] == pytest.approx(89.50)
+        call_kwargs = balance_manager.update_from_websocket.call_args[1]
+        assert call_kwargs['balance'] == pytest.approx(500.00)
+        assert call_kwargs['mm_rate'] == pytest.approx(89.50)
 
     def test_missing_mm_rate(self, grid_strategy):
         """Test handling of missing MM Rate in wallet data"""
@@ -619,9 +622,9 @@ class TestOnWalletUpdate:
         grid_strategy.on_wallet_update(wallet_data)
 
         # Should call with None for MM Rate
-        call_args = balance_manager.update_from_websocket.call_args[0]
-        assert call_args[0] == pytest.approx(500.00)
-        assert call_args[1] is None
+        call_kwargs = balance_manager.update_from_websocket.call_args[1]
+        assert call_kwargs['balance'] == pytest.approx(500.00)
+        assert call_kwargs['mm_rate'] is None
 
     def test_invalid_wallet_data_handling(self, grid_strategy):
         """Test that invalid wallet data doesn't crash"""

@@ -14,6 +14,7 @@ from config.constants import TradingConstants, LogMessages
 
 if TYPE_CHECKING:
     from ..analytics.metrics_tracker import MetricsTracker
+    from ..core.trading_account import TradingAccount
 
 
 class GridStrategy:
@@ -28,7 +29,8 @@ class GridStrategy:
         metrics_tracker: Optional['MetricsTracker'] = None,
         account_id: int = 0,
         account_logger: Optional[logging.Logger] = None,
-        balance_manager: Optional['BalanceManager'] = None
+        balance_manager: Optional['BalanceManager'] = None,
+        trading_account: Optional['TradingAccount'] = None
     ):
         """
         Initialize grid strategy
@@ -42,6 +44,7 @@ class GridStrategy:
             account_id: Account ID (for multi-account support)
             account_logger: Logger from TradingAccount (logs to per-account files)
             balance_manager: Optional shared balance manager (for multi-strategy accounts)
+            trading_account: Optional reference to parent TradingAccount (for reserve checking)
         """
         # Account identification
         self.account_id = account_id
@@ -65,6 +68,9 @@ class GridStrategy:
                 client,
                 cache_ttl_seconds=TradingConstants.BALANCE_CACHE_TTL_SEC
             )
+
+        # Trading account reference (for reserve checking)
+        self.trading_account = trading_account
 
         # Load config - symbol is REQUIRED (no default!)
         if 'symbol' not in config:
@@ -109,6 +115,13 @@ class GridStrategy:
 
         # Track current price from WebSocket (eliminates need for REST get_ticker calls)
         self.current_price: float = 0.0
+
+        # ATR calculation for dynamic safety factor (Phase 1: Advanced Risk Management)
+        # Store last N prices for ATR calculation
+        self._price_history = []
+        self._atr_period = 20  # Last 20 price updates
+        self._cached_atr_percent = None
+        self._atr_last_update = 0
 
         self.logger.info(
             f"[{self.symbol}] Grid strategy initialized - Symbol: {self.symbol}, "
@@ -226,20 +239,23 @@ class GridStrategy:
         """
         return qty * price
 
-    def _open_initial_position(self, side: str, current_price: float):
+    def _open_initial_position(self, side: str, current_price: float, custom_margin_usd: Optional[float] = None):
         """
         Open initial position for a side
 
         Args:
             side: 'Buy' for LONG or 'Sell' for SHORT
             current_price: Current market price
+            custom_margin_usd: Optional custom margin in USD (for adaptive reopen). If not provided, uses initial_size_usd
 
         Raises:
             Exception: If order placement fails (in live mode)
         """
-        initial_qty = self._usd_to_qty(self.initial_size_usd, current_price)
+        # Use custom margin if provided, otherwise use default initial size
+        margin_usd = custom_margin_usd if custom_margin_usd is not None else self.initial_size_usd
+        initial_qty = self._usd_to_qty(margin_usd, current_price)
         self.logger.info(
-            f"🆕 [{self.symbol}] Opening initial {side} position: ${self.initial_size_usd} "
+            f"🆕 [{self.symbol}] Opening initial {side} position: ${margin_usd:.2f} "
             f"({initial_qty:.6f} {self.symbol}) @ ${current_price:.4f}"
         )
 
@@ -270,13 +286,19 @@ class GridStrategy:
 
         # Log to metrics
         if self.metrics_tracker:
+            # Determine reason based on whether custom margin was used
+            if custom_margin_usd is not None:
+                reason = f"Adaptive reopen (${margin_usd:.2f})"
+            else:
+                reason = "Initial position"
+
             self.metrics_tracker.log_trade(
                 symbol=self.symbol,
                 side=side,
                 action="OPEN",
                 price=current_price,
                 quantity=initial_qty,
-                reason="Initial position",
+                reason=reason,
                 pnl=None
             )
 
@@ -288,6 +310,166 @@ class GridStrategy:
             True if emergency stop was triggered, False otherwise
         """
         return self.emergency_stopped
+
+    def determine_trend_side(self) -> tuple[str, str, str]:
+        """
+        Determine trend direction based on grid levels (Phase 4: Advanced Risk Management)
+
+        The side that has averaged MORE is the TREND side (price moved against it).
+
+        Returns:
+            (trend_side, counter_trend_side, trend_direction)
+            Example: ('Sell', 'Buy', 'DOWN') means downtrend
+        """
+        long_level = self.pm.get_position_count('Buy')
+        short_level = self.pm.get_position_count('Sell')
+
+        if short_level > long_level:
+            # SHORT усреднялся больше → downtrend (цена падала)
+            return ('Sell', 'Buy', 'DOWN')
+        else:
+            # LONG усреднялся больше → uptrend (цена росла)
+            return ('Buy', 'Sell', 'UP')
+
+    def get_total_margin(self, side: str) -> float:
+        """
+        Calculate total margin used by a side (Phase 5: Advanced Risk Management)
+
+        Args:
+            side: 'Buy' or 'Sell'
+
+        Returns:
+            Total margin in USD
+        """
+        positions = self.pm.long_positions if side == 'Buy' else self.pm.short_positions
+        total_margin = 0.0
+
+        for pos in positions:
+            # Position value = quantity × current_price
+            position_value = pos.quantity * self.current_price
+            # Margin = position_value / leverage
+            margin = position_value / self.leverage
+            total_margin += margin
+
+        return total_margin
+
+    def calculate_reopen_size(self, closed_side: str, opposite_side: str) -> float:
+        """
+        Calculate adaptive reopen size based on margin ratio (Phase 5: Advanced Risk Management)
+
+        Uses margin ratio instead of level_diff to adapt to price changes.
+
+        Args:
+            closed_side: Side that closed ('Buy' or 'Sell')
+            opposite_side: Side still open ('Sell' or 'Buy')
+
+        Returns:
+            Reopen margin in USD
+        """
+        # Get opposite side margin
+        opposite_margin = self.get_total_margin(opposite_side)
+
+        # Calculate margin ratio
+        closed_initial_margin = self.initial_size_usd
+        if closed_initial_margin == 0:
+            # Fallback
+            return self.initial_size_usd
+
+        margin_ratio = opposite_margin / closed_initial_margin
+
+        # Determine reopen coefficient based on ratio
+        if margin_ratio >= 16:
+            reopen_coefficient = 1.0  # 100%
+            self.logger.info(
+                f"[{self.symbol}] Large margin imbalance ({margin_ratio:.1f}×): 100% reopen"
+            )
+        elif margin_ratio >= 8:
+            reopen_coefficient = 0.5  # 50%
+            self.logger.info(
+                f"[{self.symbol}] Medium margin imbalance ({margin_ratio:.1f}×): 50% reopen"
+            )
+        elif margin_ratio >= 4:
+            reopen_coefficient = 0.25  # 25%
+            self.logger.info(
+                f"[{self.symbol}] Moderate margin imbalance ({margin_ratio:.1f}×): 25% reopen"
+            )
+        else:
+            # Small imbalance → initial reopen
+            self.logger.info(
+                f"[{self.symbol}] Small margin imbalance ({margin_ratio:.1f}×): initial reopen"
+            )
+            return closed_initial_margin
+
+        # Calculate reopen margin
+        reopen_margin = opposite_margin * reopen_coefficient
+
+        self.logger.info(
+            f"[{self.symbol}] Adaptive reopen: opposite_margin=${opposite_margin:.2f}, "
+            f"ratio={margin_ratio:.1f}×, coef={reopen_coefficient:.0%}, "
+            f"reopen_margin=${reopen_margin:.2f}"
+        )
+
+        return reopen_margin
+
+    def calculate_atr_percent(self) -> float:
+        """
+        Calculate Average True Range (ATR) as percentage of current price
+
+        ATR measures market volatility over the last N price updates.
+        Used for dynamic safety factor calculation.
+
+        Returns:
+            ATR as percentage (e.g., 1.5 for 1.5%)
+            Returns 1.5 if insufficient data (default medium volatility)
+        """
+        # Return cached value if updated recently (within 60 seconds)
+        if self._cached_atr_percent is not None:
+            time_since_update = time.time() - self._atr_last_update
+            if time_since_update < 60:
+                return self._cached_atr_percent
+
+        # Need at least 2 prices to calculate ranges
+        if len(self._price_history) < 2:
+            self._cached_atr_percent = 1.5  # Default: medium volatility
+            return self._cached_atr_percent
+
+        # Calculate true ranges for all consecutive prices
+        true_ranges = []
+        for i in range(1, len(self._price_history)):
+            prev_price = self._price_history[i-1]
+            curr_price = self._price_history[i]
+
+            # True range = abs(high - low) for single price = abs(curr - prev)
+            true_range = abs(curr_price - prev_price)
+            true_ranges.append(true_range)
+
+        # Average true range
+        atr = sum(true_ranges) / len(true_ranges)
+
+        # Convert to percentage of current price
+        if self.current_price > 0:
+            atr_percent = (atr / self.current_price) * 100
+        else:
+            atr_percent = 1.5  # Fallback
+
+        # Cache result
+        self._cached_atr_percent = atr_percent
+        self._atr_last_update = time.time()
+
+        return atr_percent
+
+    def _update_price_history(self, price: float):
+        """
+        Update price history for ATR calculation
+
+        Args:
+            price: New price to add to history
+        """
+        self._price_history.append(price)
+
+        # Keep only last N prices
+        if len(self._price_history) > self._atr_period:
+            self._price_history.pop(0)
 
     def _create_emergency_stop_flag(self, reason: str):
         """
@@ -597,12 +779,16 @@ class GridStrategy:
             # Check if we should reopen
             if not self.emergency_stopped and not self.dry_run:
                 try:
-                    # Open new initial position at current market
+                    # Calculate adaptive reopen size (Phase 5: Advanced Risk Management)
+                    opposite_side = 'Sell' if closed_position_side == 'Buy' else 'Buy'
+                    reopen_margin = self.calculate_reopen_size(closed_position_side, opposite_side)
+
+                    # Log adaptive reopen calculation
                     self.logger.info(
-                        f"🆕 [{symbol}] Reopening {closed_position_side} position after TP..."
+                        f"🆕 [{symbol}] ADAPTIVE REOPEN: {closed_position_side} with ${reopen_margin:.2f} margin after TP"
                     )
 
-                    qty = self._usd_to_qty(self.initial_size_usd, current_price)
+                    qty = self._usd_to_qty(reopen_margin, current_price)
 
                     order_response = self.client.place_order(
                         symbol=symbol,
@@ -630,7 +816,7 @@ class GridStrategy:
                                 action="OPEN",
                                 price=current_price,
                                 quantity=qty,
-                                reason="Reopen after TP"
+                                reason=f"Adaptive reopen (${reopen_margin:.2f})"
                             )
                 except Exception as e:
                     self.logger.error(f"❌ [{symbol}] Failed to reopen position: {e}")
@@ -762,6 +948,9 @@ class GridStrategy:
         # Store current price (from WebSocket)
         self.current_price = current_price
 
+        # Update price history for ATR calculation (Phase 1: Advanced Risk Management)
+        self._update_price_history(current_price)
+
         # Block all operations if emergency stop was triggered
         if self.emergency_stopped:
             return
@@ -875,32 +1064,47 @@ class GridStrategy:
             new_size = self._usd_to_qty(new_margin_usd, current_price)
             grid_level = self.pm.get_position_count(side)
 
-            # Check if we have enough available balance (using BalanceManager)
+            # CRITICAL: Check safety reserve before averaging (account-level check)
             if not self.dry_run:
                 try:
-                    available_balance = self.balance_manager.get_available_balance()
+                    # Use account-level reserve check if TradingAccount is available
+                    # This accounts for ALL symbols and dynamic safety reserve
+                    if self.trading_account:
+                        # Account-level check with safety reserve for ALL symbols
+                        if not self.trading_account.check_reserve_before_averaging(
+                            symbol=self.symbol,
+                            side=side,
+                            next_averaging_margin=new_margin_usd
+                        ):
+                            # Reserve check failed - don't place order
+                            # Warning already logged by check_reserve_before_averaging()
+                            return
+                    else:
+                        # Fallback: Simple balance check (for tests and standalone mode)
+                        # This doesn't account for safety reserve!
+                        available_balance = self.balance_manager.get_available_balance()
 
-                    # Check if we have enough balance for this order
-                    if new_margin_usd > available_balance:
-                        # Throttle warning to avoid spam (max once per minute)
-                        current_time = time.time()
-                        warning_key = f'insufficient_balance_{side}'
-                        if warning_key not in self._last_warning_time:
-                            self._last_warning_time[warning_key] = 0
+                        if new_margin_usd > available_balance:
+                            # Throttle warning to avoid spam (max once per minute)
+                            current_time = time.time()
+                            warning_key = f'insufficient_balance_{side}'
+                            if warning_key not in self._last_warning_time:
+                                self._last_warning_time[warning_key] = 0
 
-                        if current_time - self._last_warning_time[warning_key] >= self._warning_interval:
-                            self.logger.warning(
-                                LogMessages.INSUFFICIENT_BALANCE.format(
-                                    symbol=self.symbol,
-                                    side=side,
-                                    needed=new_margin_usd,
-                                    available=available_balance
+                            if current_time - self._last_warning_time[warning_key] >= self._warning_interval:
+                                self.logger.warning(
+                                    LogMessages.INSUFFICIENT_BALANCE.format(
+                                        symbol=self.symbol,
+                                        side=side,
+                                        needed=new_margin_usd,
+                                        available=available_balance
+                                    )
                                 )
-                            )
-                            self._last_warning_time[warning_key] = current_time
-                        return  # Don't place order
+                                self._last_warning_time[warning_key] = current_time
+                            return  # Don't place order
+
                 except Exception as e:
-                    self.logger.error(f"[{self.symbol}] Failed to check balance before order: {e}")
+                    self.logger.error(f"[{self.symbol}] Failed to check balance/reserve before order: {e}")
                     return  # Don't place order if we can't verify balance
 
             self.logger.info(
@@ -1145,7 +1349,16 @@ class GridStrategy:
                         current_price = float(avg_price) if avg_price else 0.0
                         if current_price > 0:
                             try:
-                                self._open_initial_position(side, current_price)
+                                # Calculate adaptive reopen size (Phase 5: Advanced Risk Management)
+                                opposite_side = 'Sell' if side == 'Buy' else 'Buy'
+                                reopen_margin = self.calculate_reopen_size(side, opposite_side)
+
+                                self.logger.info(
+                                    f"[{self.symbol}] ADAPTIVE REOPEN via WebSocket: {side} with ${reopen_margin:.2f} margin"
+                                )
+
+                                # Open with custom margin
+                                self._open_initial_position(side, current_price, custom_margin_usd=reopen_margin)
                             except Exception as e:
                                 self.logger.error(
                                     f"[{self.symbol}] Failed to reopen {side} position after WebSocket close: {e}"
@@ -1213,32 +1426,57 @@ class GridStrategy:
         """
         Handle wallet update from WebSocket
 
-        Called when wallet stream sends an update. Updates balance and MM Rate cache.
+        Called when wallet stream sends an update. Updates balance, MM Rate, Initial Margin,
+        and Maintenance Margin cache.
 
         Args:
             wallet_data: Wallet data from Bybit WebSocket
         """
         try:
-            # Extract balance and MM Rate
+            # Extract ALL balance fields from WebSocket
             total_available = wallet_data.get('totalAvailableBalance')
             account_mm_rate = wallet_data.get('accountMMRate')
+            total_initial_margin = wallet_data.get('totalInitialMargin')
+            total_maintenance_margin = wallet_data.get('totalMaintenanceMargin')
 
             if total_available is not None:
                 balance = float(total_available)
 
-                # Update BalanceManager cache from WebSocket
+                # Update BalanceManager cache from WebSocket with ALL fields
                 if self.balance_manager:
                     # Convert MM Rate from decimal to percentage (e.g., 0.0017 -> 0.17%)
                     mm_rate_pct = None
                     if account_mm_rate and account_mm_rate != '':
                         mm_rate_pct = float(account_mm_rate) * 100
 
-                    self.balance_manager.update_from_websocket(balance, mm_rate_pct)
+                    # Convert Initial Margin to float
+                    initial_margin = None
+                    if total_initial_margin and total_initial_margin != '':
+                        initial_margin = float(total_initial_margin)
 
-                    self.logger.debug(
-                        f"[{self.symbol}] Wallet update: ${balance:.2f}, "
-                        f"MM Rate: {mm_rate_pct:.4f}%" if mm_rate_pct else f"${balance:.2f}"
+                    # Convert Maintenance Margin to float
+                    maintenance_margin = None
+                    if total_maintenance_margin and total_maintenance_margin != '':
+                        maintenance_margin = float(total_maintenance_margin)
+
+                    # Update BalanceManager with all fields
+                    self.balance_manager.update_from_websocket(
+                        balance=balance,
+                        mm_rate=mm_rate_pct,
+                        initial_margin=initial_margin,
+                        maintenance_margin=maintenance_margin
                     )
+
+                    # Build log message
+                    log_parts = [f"${balance:.2f}"]
+                    if mm_rate_pct is not None:
+                        log_parts.append(f"MM Rate: {mm_rate_pct:.4f}%")
+                    if initial_margin is not None:
+                        log_parts.append(f"IM: ${initial_margin:.2f}")
+                    if maintenance_margin is not None:
+                        log_parts.append(f"MM: ${maintenance_margin:.2f}")
+
+                    self.logger.debug(f"[{self.symbol}] Wallet update: {', '.join(log_parts)}")
 
         except Exception as e:
             self.logger.error(

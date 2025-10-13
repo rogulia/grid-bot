@@ -35,6 +35,8 @@ class BalanceManager:
         # Cache (updated by WebSocket, not by polling)
         self._cached_balance: Optional[float] = None
         self._cached_mm_rate: Optional[float] = None
+        self._cached_initial_margin: Optional[float] = None
+        self._cached_maintenance_margin: Optional[float] = None
         self._cached_full_data: Optional[Dict] = None
         self._last_update_time: float = 0  # Timestamp of last WebSocket update
 
@@ -78,6 +80,40 @@ class BalanceManager:
         with self._lock:
             return self._cached_mm_rate
 
+    def get_initial_margin(self, force_refresh: bool = False) -> Optional[float]:
+        """
+        Get Total Initial Margin used by positions (from WebSocket cache)
+
+        Args:
+            force_refresh: Force refresh from REST API (DEPRECATED - only for startup)
+
+        Returns:
+            Initial Margin in USDT or None if not available
+        """
+        if force_refresh:
+            # Force refresh only at startup before WebSocket is connected
+            self._refresh_balance_from_api()
+
+        with self._lock:
+            return self._cached_initial_margin
+
+    def get_maintenance_margin(self, force_refresh: bool = False) -> Optional[float]:
+        """
+        Get Total Maintenance Margin required (from WebSocket cache)
+
+        Args:
+            force_refresh: Force refresh from REST API (DEPRECATED - only for startup)
+
+        Returns:
+            Maintenance Margin in USDT or None if not available
+        """
+        if force_refresh:
+            # Force refresh only at startup before WebSocket is connected
+            self._refresh_balance_from_api()
+
+        with self._lock:
+            return self._cached_maintenance_margin
+
     def get_full_balance_data(self, force_refresh: bool = False) -> Dict:
         """
         Get full balance data (from WebSocket cache)
@@ -95,7 +131,13 @@ class BalanceManager:
         with self._lock:
             return self._cached_full_data or {}
 
-    def update_from_websocket(self, balance: float, mm_rate: Optional[float] = None):
+    def update_from_websocket(
+        self,
+        balance: float,
+        mm_rate: Optional[float] = None,
+        initial_margin: Optional[float] = None,
+        maintenance_margin: Optional[float] = None
+    ):
         """
         Update balance cache from Wallet WebSocket
 
@@ -105,16 +147,26 @@ class BalanceManager:
         Args:
             balance: Total available balance in USDT
             mm_rate: Account Maintenance Margin Rate as percentage (e.g., 0.17 for 0.17%)
+            initial_margin: Total Initial Margin used by positions in USDT
+            maintenance_margin: Total Maintenance Margin required in USDT
         """
         with self._lock:
             self._cached_balance = balance
             self._cached_mm_rate = mm_rate
+            self._cached_initial_margin = initial_margin
+            self._cached_maintenance_margin = maintenance_margin
             self._last_update_time = time.time()
 
-        self.logger.debug(
-            f"Balance updated from WebSocket: ${balance:.2f}, "
-            f"MM Rate: {mm_rate:.4f}%" if mm_rate is not None else f"${balance:.2f}"
-        )
+        # Build debug message
+        msg_parts = [f"${balance:.2f}"]
+        if mm_rate is not None:
+            msg_parts.append(f"MM Rate: {mm_rate:.4f}%")
+        if initial_margin is not None:
+            msg_parts.append(f"IM: ${initial_margin:.2f}")
+        if maintenance_margin is not None:
+            msg_parts.append(f"MM: ${maintenance_margin:.2f}")
+
+        self.logger.debug(f"Balance updated from WebSocket: {', '.join(msg_parts)}")
 
     def _refresh_balance_from_api(self):
         """
@@ -144,16 +196,36 @@ class BalanceManager:
                         else:
                             self._cached_mm_rate = None
 
+                        # Extract Initial Margin
+                        total_im_str = account.get('totalInitialMargin', '')
+                        if total_im_str and total_im_str != '':
+                            self._cached_initial_margin = float(total_im_str)
+                        else:
+                            self._cached_initial_margin = None
+
+                        # Extract Maintenance Margin
+                        total_mm_str = account.get('totalMaintenanceMargin', '')
+                        if total_mm_str and total_mm_str != '':
+                            self._cached_maintenance_margin = float(total_mm_str)
+                        else:
+                            self._cached_maintenance_margin = None
+
                         # Store full data for advanced usage
                         self._cached_full_data = account
 
                         # Update timestamp
                         self._last_update_time = time.time()
 
-                    self.logger.info(
-                        f"Initial balance from API: ${self._cached_balance:.2f}, "
-                        f"MM Rate: {self._cached_mm_rate:.4f}%" if self._cached_mm_rate else "MM Rate: N/A"
-                    )
+                    # Build log message
+                    msg_parts = [f"${self._cached_balance:.2f}"]
+                    if self._cached_mm_rate is not None:
+                        msg_parts.append(f"MM Rate: {self._cached_mm_rate:.4f}%")
+                    if self._cached_initial_margin is not None:
+                        msg_parts.append(f"IM: ${self._cached_initial_margin:.2f}")
+                    if self._cached_maintenance_margin is not None:
+                        msg_parts.append(f"MM: ${self._cached_maintenance_margin:.2f}")
+
+                    self.logger.info(f"Initial balance from API: {', '.join(msg_parts)}")
                     return
 
             raise RuntimeError("UNIFIED account not found in balance response")
