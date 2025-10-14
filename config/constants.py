@@ -29,6 +29,12 @@ class TradingConstants:
     BYBIT_TAKER_FEE_RATE = 0.00055  # 0.055% taker fee on Bybit (market orders)
     BYBIT_MAKER_FEE_RATE = 0.00020  # 0.020% maker fee on Bybit (limit orders)
 
+    # === Limit Orders ===
+
+    LIMIT_ORDER_PRICE_OFFSET_PERCENT = 0.03  # Price offset from market (0.03% for balance)
+    LIMIT_ORDER_TIMEOUT_SEC = 10             # Timeout before retry (10 seconds)
+    LIMIT_ORDER_MAX_RETRIES = 3              # Max retries before fallback to market
+
     # === WebSocket ===
 
     WEBSOCKET_LOG_EVERY_N_UPDATES = 10  # Log every Nth price update
