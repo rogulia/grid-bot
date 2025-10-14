@@ -240,7 +240,14 @@ class LimitOrderManager:
             # Check if order is still pending
             self.logger.info(f"[{self.symbol}] 🔍 Order {order_id} status: {order_info['status']}")
             if order_info['status'] != 'New':
-                self.logger.info(f"[{self.symbol}] ⏭️  Order {order_id} status is {order_info['status']}, skipping timeout handling")
+                self.logger.info(f"[{self.symbol}] ⏭️  Order {order_id} already {order_info['status']}, cleaning up")
+                # Clean up from tracking
+                with self._lock:
+                    if order_id in self._tracked_orders:
+                        del self._tracked_orders[order_id]
+                    if order_id in self._timers:
+                        self._timers[order_id].cancel()
+                        del self._timers[order_id]
                 return  # Already filled or cancelled
         
         self.logger.warning(
@@ -376,7 +383,7 @@ class LimitOrderManager:
         order_id = order_data.get('orderId')
         order_status = order_data.get('orderStatus')
         
-        self.logger.debug(f"[{self.symbol}] 📨 LimitOrderManager.on_order_update: order={order_id}, status={order_status}")
+        self.logger.info(f"[{self.symbol}] 📨 LimitOrderManager.on_order_update: order={order_id}, status={order_status}")
         
         with self._lock:
             if order_id not in self._tracked_orders:
@@ -452,6 +459,29 @@ class LimitOrderManager:
         """
         with self._lock:
             return self._tracked_orders.get(order_id)
+
+    def cleanup_old_orders(self, max_age_seconds: int = 60):
+        """
+        Remove orders older than max_age_seconds from tracking
+        
+        Args:
+            max_age_seconds: Max age before cleanup (default 60s)
+        """
+        current_time = time.time()
+        to_remove = []
+        
+        with self._lock:
+            for order_id, order_info in self._tracked_orders.items():
+                age = current_time - order_info['placed_at']
+                if age > max_age_seconds:
+                    to_remove.append((order_id, age))
+            
+            for order_id, age in to_remove:
+                self.logger.info(f"[{self.symbol}] 🧹 Cleaning up old order {order_id} (age: {age:.0f}s)")
+                del self._tracked_orders[order_id]
+                if order_id in self._timers:
+                    self._timers[order_id].cancel()
+                    del self._timers[order_id]
 
     def cleanup(self):
         """

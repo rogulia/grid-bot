@@ -1139,10 +1139,24 @@ class GridStrategy:
             is_close = closed_size > 0 or closed_pnl != 0
 
             if not is_close:
-                # Position open/add - just log
+                # Position open/add - log
                 self.logger.debug(
                     f"📝 [{symbol}] {side} OPEN: qty={exec_qty} price={exec_price}"
                 )
+                
+                # Detect limit orders and notify LimitOrderManager
+                order_id = exec_data.get('orderId', '')
+                if order_type == 'Limit' and order_id:
+                    # Limit order executed - notify LimitOrderManager
+                    synthetic_order_data = {
+                        'orderId': order_id,
+                        'orderStatus': 'Filled',
+                        'orderType': 'Limit',
+                        'side': side,
+                        'execQty': exec_qty
+                    }
+                    self.limit_order_manager.on_order_update(synthetic_order_data)
+                
                 return
 
             # POSITION CLOSE - process with real data from exchange
@@ -1483,6 +1497,14 @@ class GridStrategy:
             with self.limit_order_manager._lock:
                 for order_id in list(self.limit_order_manager._tracked_orders.keys()):
                     self.limit_order_manager.update_current_price(order_id, current_price)
+            
+            # Periodically cleanup old orders (once per minute)
+            if not hasattr(self, '_last_cleanup_time'):
+                self._last_cleanup_time = 0
+            
+            if time.time() - self._last_cleanup_time > 60:
+                self.limit_order_manager.cleanup_old_orders(max_age_seconds=120)
+                self._last_cleanup_time = time.time()
 
         # Block all operations if emergency stop was triggered
         if self.emergency_stopped:
@@ -1925,6 +1947,16 @@ class GridStrategy:
                 if local_qty == 0:
                     # Position exists on exchange but not tracked locally
                     # This happens on bot restart - restore from Position WebSocket snapshot
+                    
+                    # CRITICAL: Skip restoration if avgPrice is missing
+                    # REST API sync will restore it properly with correct price
+                    if not avg_price or avg_price == '0' or float(avg_price) == 0.0:
+                        self.logger.warning(
+                            f"⚠️  [{self.symbol}] Skipping {side} position restoration from WebSocket: "
+                            f"avgPrice is missing (size={size_float}). Will restore via REST sync."
+                        )
+                        return
+                    
                     self.logger.info(
                         f"📥 [{self.symbol}] Restoring {side} position from Position WebSocket: "
                         f"{size_float} @ ${avg_price}"
@@ -1934,7 +1966,7 @@ class GridStrategy:
                     # Note: We lose grid level details, but exchange avgPrice is accurate
                     self.pm.add_position(
                         side=side,
-                        entry_price=float(avg_price) if avg_price else 0.0,
+                        entry_price=float(avg_price),
                         quantity=size_float,
                         grid_level=0,  # Restored position (no grid history)
                         order_id=None  # Position WebSocket doesn't provide orderId
