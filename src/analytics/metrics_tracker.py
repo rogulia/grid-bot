@@ -401,6 +401,8 @@ class MetricsTracker:
         """
         # Check if trades CSV file exists (with date suffix)
         trades_csv = self.data_dir / f"{self.file_prefix}trades_history_{date}.csv"
+        metrics_csv = self.data_dir / f"{self.file_prefix}performance_metrics_{date}.csv"
+
         if not trades_csv.exists():
             self.logger.info(f"No trades history file found for daily report {date}")
             return None
@@ -414,6 +416,40 @@ class MetricsTracker:
             self.logger.error(f"Failed to read trades CSV for daily report: {e}")
             return None
 
+        # Read performance metrics from CSV (for initial/final balance and drawdown)
+        initial_balance = self.initial_balance  # fallback to current initial_balance
+        final_balance = self.initial_balance
+        max_drawdown = 0.0
+        peak_balance = self.initial_balance
+
+        if metrics_csv.exists():
+            try:
+                with open(metrics_csv, 'r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    metrics_rows = list(reader)
+
+                if metrics_rows:
+                    # Get initial balance from first row
+                    initial_balance = float(metrics_rows[0]['balance'])
+                    # Get final balance from last row
+                    final_balance = float(metrics_rows[-1]['balance'])
+
+                    # Calculate max drawdown from performance metrics
+                    balances = [float(row['balance']) for row in metrics_rows]
+                    peak_balance = initial_balance
+                    max_drawdown = 0.0
+
+                    for balance in balances:
+                        if balance > peak_balance:
+                            peak_balance = balance
+                        drawdown = peak_balance - balance
+                        if drawdown > max_drawdown:
+                            max_drawdown = drawdown
+
+                    self.logger.debug(f"Read balance from metrics: initial=${initial_balance:.2f}, final=${final_balance:.2f}")
+            except Exception as e:
+                self.logger.warning(f"Failed to read performance metrics CSV: {e}. Using fallback values.")
+
         # Filter trades by date (timestamp format: "2025-10-11 13:39:19")
         daily_trades = [t for t in all_trades if t['timestamp'].startswith(date)]
 
@@ -424,25 +460,25 @@ class MetricsTracker:
         self.logger.info(f"📊 Generating daily report for {date} ({len(daily_trades)} trades)")
 
         # Calculate daily statistics
-        closing_trades = [t for t in daily_trades if t['action'] == 'CLOSE' and t.get('pnl')]
+        closing_trades = [t for t in daily_trades if t['action'] == 'CLOSE' and t.get('pnl') and t['pnl'].strip()]
 
         if not closing_trades:
             self.logger.info(f"No closed trades for {date}, skipping report")
             return None
 
         # Calculate PnL
-        realized_pnl = sum(float(t['pnl']) for t in closing_trades if t.get('pnl'))
+        realized_pnl = sum(float(t['pnl']) for t in closing_trades)
         total_fees = sum(
-            float(t.get('open_fee', 0)) + float(t.get('close_fee', 0)) + float(t.get('funding_fee', 0))
+            float(t.get('open_fee', 0) or 0) + float(t.get('close_fee', 0) or 0) + float(t.get('funding_fee', 0) or 0)
             for t in closing_trades
         )
 
         # Win/loss stats
-        winning = [t for t in closing_trades if float(t.get('pnl', 0)) > 0]
-        losing = [t for t in closing_trades if float(t.get('pnl', 0)) < 0]
+        winning = [t for t in closing_trades if float(t['pnl']) > 0]
+        losing = [t for t in closing_trades if float(t['pnl']) < 0]
         win_rate = (len(winning) / len(closing_trades) * 100) if closing_trades else 0
 
-        # Best/worst trades
+        # Best/worst trades (from CSV data, not self.trades!)
         pnls = [float(t['pnl']) for t in closing_trades]
         best_trade = max(pnls) if pnls else 0
         worst_trade = min(pnls) if pnls else 0
@@ -450,11 +486,16 @@ class MetricsTracker:
 
         # Store original tracker state
         original_start = self.start_time
+        original_initial = self.initial_balance
+        original_current = self.current_balance
         original_realized = self.realized_pnl
         original_winning = self.winning_trades
         original_losing = self.losing_trades
         original_total = self.total_trades
         original_pnl = self.total_pnl
+        original_max_drawdown = self.max_drawdown
+        original_peak = self.peak_balance
+        original_trades = self.trades.copy()
 
         # Temporarily set daily values
         # Create timezone-aware datetime for Helsinki
@@ -469,11 +510,34 @@ class MetricsTracker:
         naive_end = datetime.strptime(f"{date} 23:59:59", "%Y-%m-%d %H:%M:%S")
         end_time = helsinki_tz.localize(naive_end)
 
+        # Set temporary state for report generation
+        self.initial_balance = initial_balance
+        self.current_balance = final_balance
         self.realized_pnl = realized_pnl
         self.winning_trades = len(winning)
         self.losing_trades = len(losing)
         self.total_trades = len(daily_trades)
-        self.total_pnl = realized_pnl
+        self.total_pnl = realized_pnl  # For daily report, total_pnl = realized_pnl (no unrealized)
+        self.max_drawdown = max_drawdown
+        self.peak_balance = peak_balance
+
+        # Create temporary trades list with TradeMetric objects from CSV
+        self.trades = []
+        for t in closing_trades:
+            trade = TradeMetric(
+                timestamp=t['timestamp'],
+                symbol=t['symbol'],
+                side=t['side'],
+                action=t['action'],
+                price=float(t['price']),
+                quantity=float(t['quantity']),
+                reason=t['reason'],
+                pnl=float(t['pnl']),
+                open_fee=float(t.get('open_fee', 0) or 0),
+                close_fee=float(t.get('close_fee', 0) or 0),
+                funding_fee=float(t.get('funding_fee', 0) or 0)
+            )
+            self.trades.append(trade)
 
         try:
             # Generate and save report with date suffix and end time
@@ -488,8 +552,13 @@ class MetricsTracker:
         finally:
             # Restore original tracker state
             self.start_time = original_start
+            self.initial_balance = original_initial
+            self.current_balance = original_current
             self.realized_pnl = original_realized
             self.winning_trades = original_winning
             self.losing_trades = original_losing
             self.total_trades = original_total
             self.total_pnl = original_pnl
+            self.max_drawdown = original_max_drawdown
+            self.peak_balance = original_peak
+            self.trades = original_trades
