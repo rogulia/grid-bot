@@ -22,10 +22,10 @@ SOL-Trader is a **multi-account** automated Bybit futures trading bot implementi
    - `state_manager.py`: Persists account state to JSON (e.g., `data/001_bot_state.json`) per account
 
 2. **Exchange Layer** (`src/exchange/`)
-   - `bybit_client.py`: HTTP API wrapper using pybit for **commands only** (order execution, leverage setting). No monitoring/polling.
-   - `bybit_websocket.py`: **WebSocket-First Architecture** - ALL monitoring data via WebSocket streams:
+   - `bybit_client.py`: HTTP API wrapper using pybit for **commands** (order execution, leverage setting) and **position queries** (get_active_position at startup)
+   - `bybit_websocket.py`: **REST API + WebSocket Hybrid** - Position sync via REST API, real-time updates via WebSocket:
      - **Public Stream:** Real-time price updates (ticker)
-     - **Private Streams:** Position updates (snapshot + real-time), wallet updates (balance/MM rate), order updates (TP tracking)
+     - **Private Streams:** Execution updates (real-time TP/closes), wallet updates (balance/MM rate), order updates (TP tracking)
      - **Reliability Features:** Auto-reconnect with exponential backoff, heartbeat monitoring for silent disconnects
      - **Thread-Safe:** All callbacks run in separate threads with proper locking
 
@@ -59,10 +59,16 @@ The bot operates via **WebSocket callback system** (no REST API polling):
    - Take profit triggers (price moved tp_percent in favor of position)
 4. Position manager tracks all positions with grid levels and calculates PnL
 
-**Position Updates (Private WebSocket):**
-- Position WebSocket sends snapshot on connect → restores positions after restart
-- Real-time updates on position changes → detects closures, calculates PnL
-- Automatic reopening after TP closure
+**Position Restoration (REST API at startup):**
+- `get_active_position()` fetches real position state from exchange on bot start
+- Compares exchange vs local with strict tolerance (0.001)
+- Restores positions if exchange has them but local tracking is empty
+- Fail-fast on unexplained mismatches
+
+**Execution Updates (Private WebSocket during operation):**
+- Execution WebSocket reports real-time closes with PnL
+- Detects TP fills, manual closes, liquidations
+- Automatic reopening after position closes
 
 **Wallet Updates (Private WebSocket):**
 - Real-time balance and MM Rate updates → cached in balance_manager
@@ -73,11 +79,12 @@ The bot operates via **WebSocket callback system** (no REST API polling):
 - No REST API polling for order status
 
 **Periodic Sync (Every 60 seconds):**
-- `sync_with_exchange()` checks if TP orders exist, opens initial positions if needed
-- **No REST API calls** - all data from WebSocket
+- `sync_with_exchange()` verifies positions with REST API `get_active_position()`
+- Checks if TP orders exist for open positions
+- Detects discrepancies and fail-fast if found
 - Metrics tracker logs snapshots
 
-**Key Insight:** Each side (LONG/SHORT) is managed independently. Positions are added when price moves against the side (averaging down/up), and closed when price reverses favorably. **All monitoring data comes from WebSocket streams in real-time.**
+**Key Insight:** Each side (LONG/SHORT) is managed independently. Positions are added when price moves against the side (averaging down/up), and closed when price reverses favorably. **Position restoration uses REST API (startup), real-time updates use Execution WebSocket (operation).**
 
 ### Critical Architecture Decisions
 
@@ -470,34 +477,38 @@ These methods maintain consistency with `last_long_entry` and `last_short_entry`
 
 ### State Persistence and Sync
 
-**WebSocket-First Architecture:**
-The bot uses Position WebSocket as the source of truth, with state file auto-updating for backup only.
+**REST API + WebSocket Hybrid Architecture:**
+The bot uses REST API for position restoration at startup, and WebSocket for real-time updates during operation.
 
 **Position Restoration Flow (on bot restart):**
-1. Bot starts, Position WebSocket connects to exchange
-2. WebSocket sends snapshot of all open positions (automatic)
-3. `on_position_update()` callback receives each position
-4. If `local_qty == 0` but position exists on exchange (`size > 0`):
-   - Restore position from WebSocket data (avgPrice, quantity)
-   - Create TP order automatically
-   - Log as "RESTORE" action to metrics
+1. Bot starts, `sync_with_exchange()` called on first price update
+2. **REST API Check:** Fetches position from exchange via `get_active_position()` (source of truth)
+3. Compares `exchange_qty` vs `local_qty` with strict tolerance (0.001 for rounding only)
+4. **Decision logic:**
+   - If `qty_diff <= 0.001`: **SYNCED** → Only verify TP order exists
+   - If `exchange_qty > 0` and `local_qty == 0`: **RESTORE** → Restore position from exchange data
+   - If `exchange_qty == 0` and `local_qty == 0`: **OPEN** → Open initial position
+   - Otherwise: **FAIL-FAST** → Emergency stop (manual intervention required)
 5. State file updates automatically via `pm.add_position()`
 
-**Position Close Detection:**
-When Position WebSocket reports `size < 0.001` (position closed):
-- Fetches real PnL from `get_closed_pnl()` (REQUIRED - no fallback!)
-- Determines close reason (positive PnL = Take Profit, negative = Liquidation)
-- Logs ERROR level message with full details
-- Records to CSV via metrics_tracker
+**Position Close Detection (during operation):**
+When Execution WebSocket reports position close:
+- Uses real PnL from `execPnl` field (REQUIRED - no fallback!)
+- Determines close reason (positive PnL = Take Profit, negative = Loss/Liquidation)
+- Logs with full details to bot log and CSV
+- Records to metrics_tracker
 - Reopens positions if appropriate
 
 **Periodic Sync (Every 60 seconds):**
-- `sync_with_exchange()` checks if TP orders exist
-- Opens initial positions if no positions tracked (e.g., first run)
-- **No REST API calls for monitoring** - Position WebSocket handles all restoration
+- `sync_with_exchange()` runs REST API position check
+- Verifies TP orders exist for open positions
+- Detects any discrepancies and fail-fast if found
 
-**Key Design Decision:**
-Position WebSocket > State File. State file can be outdated after crashes/kills. Always trust WebSocket snapshot for position restoration.
+**Key Design Decisions:**
+1. **REST API at startup:** Exchange is source of truth after bot restart
+2. **Fail-Fast on mismatch:** No approximations - strict tolerance of 0.001
+3. **WebSocket during operation:** Real-time updates via Execution WebSocket
+4. **No Position WebSocket restoration:** Bybit's Position WebSocket snapshot is unreliable
 
 ## Testing Strategy
 
