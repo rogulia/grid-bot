@@ -89,7 +89,7 @@ accounts:
         take_profit_percent: 1.0
         max_grid_levels_per_side: 10
 
-  # Account 2 (ID: 2)
+  # Account 3 (ID: 3)
   - id: 3
     name: "FLOKI Demo"
     api_key_env: "3_BYBIT_API_KEY"
