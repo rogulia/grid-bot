@@ -22,6 +22,7 @@ class Position:
     quantity: float
     timestamp: datetime
     grid_level: int  # Which grid level (0 = initial, 1 = first averaging, etc.)
+    order_id: Optional[str] = None  # Order ID from exchange (for tracking)
 
     def get_pnl(self, current_price: float, leverage: int = 1) -> float:
         """
@@ -94,7 +95,8 @@ class PositionManager:
         side: str,
         entry_price: float,
         quantity: float,
-        grid_level: int = 0
+        grid_level: int = 0,
+        order_id: Optional[str] = None
     ):
         """
         Add a new position
@@ -104,13 +106,15 @@ class PositionManager:
             entry_price: Entry price
             quantity: Position quantity
             grid_level: Grid level number
+            order_id: Order ID from exchange (optional)
         """
         position = Position(
             side=side,
             entry_price=entry_price,
             quantity=quantity,
             timestamp=now_helsinki(),
-            grid_level=grid_level
+            grid_level=grid_level,
+            order_id=order_id
         )
 
         with self._lock:

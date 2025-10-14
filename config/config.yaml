@@ -15,6 +15,7 @@ accounts:
     # Per-account risk management
     risk_management:
       mm_rate_threshold: 90.0            # Emergency close when Account MM Rate >= this % (default: 90)
+      balance_buffer_percent: 15.0       # Safety buffer for reserve checks - % (default: 15)
 
     # Strategies for this account
     strategies:
@@ -36,28 +37,32 @@ accounts:
       #   take_profit_percent: 1.0
       #   max_grid_levels_per_side: 10
 
-  # Account 2 (ID: 2) - Example for second user
-  # Uncomment to add second account:
-  # - id: 2
-  #   name: "Demo Account 2"
-  #   api_key_env: "2_BYBIT_API_KEY"
-  #   api_secret_env: "2_BYBIT_API_SECRET"
-  #   demo_trading: true
-  #   dry_run: false
-  #
-  #   strategies:
-  #     - symbol: "SOLUSDT"
-  #       category: "linear"
-  #       leverage: 100
-  #       initial_position_size_usd: 1.0
-  #       grid_step_percent: 1.0
-  #       averaging_multiplier: 2.0
-  #       take_profit_percent: 1.0
-  #       max_grid_levels_per_side: 8
+  # Account 2 (ID: 2)
+  - id: 2
+    name: "Andrii Demo"
+    api_key_env: "2_BYBIT_API_KEY"
+    api_secret_env: "2_BYBIT_API_SECRET"
+    demo_trading: true
+    dry_run: false
+
+    # Per-account risk management
+    risk_management:
+      mm_rate_threshold: 90.0            # Emergency close when Account MM Rate >= this % (default: 90)
+      balance_buffer_percent: 15.0       # Safety buffer for reserve checks - % (default: 15)
+
+    strategies:
+      - symbol: "ETHUSDT"
+        category: "linear"
+        leverage: 100
+        initial_position_size_usd: 1.0
+        grid_step_percent: 1.0
+        averaging_multiplier: 2.0
+        take_profit_percent: 1.0
+        max_grid_levels_per_side: 10
 
 # Global bot settings
 bot:
-  log_level: "INFO"              # DEBUG | INFO | WARNING | ERROR
+  log_level: "DEBUG"             # DEBUG | INFO | WARNING | ERROR
 
 # DEPRECATED SETTINGS (no longer used):
 # - exchange.demo_trading -> moved to per-account

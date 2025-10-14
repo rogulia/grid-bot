@@ -21,7 +21,8 @@ class BybitWebSocket:
         api_secret: Optional[str] = None,
         position_callback: Optional[Callable[[dict], None]] = None,
         wallet_callback: Optional[Callable[[dict], None]] = None,
-        order_callback: Optional[Callable[[dict], None]] = None
+        order_callback: Optional[Callable[[dict], None]] = None,
+        websocket_logger: Optional[logging.Logger] = None
     ):
         """
         Initialize Bybit WebSocket client
@@ -36,8 +37,10 @@ class BybitWebSocket:
             position_callback: Callback function to handle position updates (optional)
             wallet_callback: Callback function to handle wallet updates (optional)
             order_callback: Callback function to handle order updates (optional)
+            websocket_logger: Logger instance to use (if None, creates default logger)
         """
-        self.logger = logging.getLogger("sol-trader.bybit_ws")
+        # Use provided logger or create default
+        self.logger = websocket_logger if websocket_logger else logging.getLogger("sol-trader.bybit_ws")
         self.symbol = symbol
         self.price_callback = price_callback
         self.position_callback = position_callback

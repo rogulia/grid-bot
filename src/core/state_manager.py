@@ -55,7 +55,8 @@ class StateManager:
                         "entry_price": p.entry_price,
                         "quantity": p.quantity,
                         "grid_level": p.grid_level,
-                        "timestamp": p.timestamp.isoformat()
+                        "timestamp": p.timestamp.isoformat(),
+                        "order_id": p.order_id
                     }
                     for p in long_positions
                 ],
@@ -65,7 +66,8 @@ class StateManager:
                         "entry_price": p.entry_price,
                         "quantity": p.quantity,
                         "grid_level": p.grid_level,
-                        "timestamp": p.timestamp.isoformat()
+                        "timestamp": p.timestamp.isoformat(),
+                        "order_id": p.order_id
                     }
                     for p in short_positions
                 ],

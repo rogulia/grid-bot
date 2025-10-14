@@ -60,8 +60,11 @@ class MultiAccountOrchestrator:
 
         today = now_helsinki().strftime("%Y-%m-%d")
 
+        # Get log level from config (defaults to INFO)
+        log_level = self.config.get('bot.log_level', 'INFO')
+
         logger = logging.getLogger("main")
-        logger.setLevel(logging.INFO)
+        logger.setLevel(getattr(logging, log_level.upper()))
         logger.propagate = False
 
         # File handler: main_2025-10-10.log
@@ -211,6 +214,9 @@ class MultiAccountOrchestrator:
                     self.logger.info(f"   Mode: {'DRY RUN' if dry_run else 'LIVE'}")
                     self.logger.info(f"   Strategies: {len(acc_config['strategies'])} symbol(s)")
 
+                    # Get log level from config (same as main logger)
+                    log_level = self.config.get('bot.log_level', 'INFO')
+
                     # Create trading account
                     account = TradingAccount(
                         account_id=account_id,
@@ -220,7 +226,8 @@ class MultiAccountOrchestrator:
                         demo=demo,
                         dry_run=dry_run,
                         strategies_config=acc_config['strategies'],
-                        risk_config=risk_config
+                        risk_config=risk_config,
+                        log_level=log_level
                     )
 
                     # Initialize account

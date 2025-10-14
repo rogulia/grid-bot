@@ -137,6 +137,11 @@ class BybitClient:
             if reduce_only:
                 order_params["reduceOnly"] = True
 
+            # Debug logging for TP orders
+            if reduce_only:
+                self.logger.info(f"🔍 TP Order Params: {order_params}")
+                print(f"[DEBUG] TP Order Params: {order_params}", flush=True)
+
             response = self.session.place_order(**order_params)
             reduce_tag = " [REDUCE ONLY]" if reduce_only else ""
             self.logger.info(
@@ -332,11 +337,14 @@ class BybitClient:
         Returns:
             Order ID or None if failed
         """
+        print(f"[DEBUG] place_tp_order ENTRY: {side} {qty} @ ${tp_price:.4f}, positionIdx={position_idx}", flush=True)
+        self.logger.info(f"🎯 place_tp_order called: {side} {qty} @ ${tp_price:.4f}, positionIdx={position_idx}")
         try:
             # Auto-detect positionIdx for Hedge Mode if not specified
             if position_idx is None:
                 position_idx = 1 if side == "Buy" else 2
 
+            self.logger.debug(f"Calling place_order with positionIdx={position_idx}, reduce_only=True")
             response = self.place_order(
                 symbol=symbol,
                 side=side,
@@ -348,15 +356,26 @@ class BybitClient:
                 reduce_only=True  # TP orders must be reduce-only!
             )
 
+            # Detailed logging of response
+            self.logger.debug(f"TP order response: {response}")
+
             if response.get('retCode') == 0:
                 order_id = response.get('result', {}).get('orderId')
-                self.logger.info(f"TP order placed: {side} {qty} @ ${tp_price:.4f} (ID: {order_id})")
-                return order_id
+                if order_id:
+                    print(f"[DEBUG] place_tp_order SUCCESS: ID={order_id}", flush=True)
+                    self.logger.info(f"✅ TP order placed: {side} {qty} @ ${tp_price:.4f} (ID: {order_id})")
+                    return order_id
+                else:
+                    print(f"[DEBUG] place_tp_order FAIL: No orderId in response", flush=True)
+                    self.logger.error(f"❌ TP order response has no orderId: {response}")
+                    return None
             else:
-                self.logger.error(f"Failed to place TP order: {response}")
+                print(f"[DEBUG] place_tp_order FAIL: retCode={response.get('retCode')}", flush=True)
+                self.logger.error(f"❌ TP order failed (retCode={response.get('retCode')}): {response}")
                 return None
         except Exception as e:
-            self.logger.error(f"Error placing TP order: {e}")
+            print(f"[DEBUG] place_tp_order EXCEPTION: {e}", flush=True)
+            self.logger.error(f"❌ Exception in place_tp_order: {e}", exc_info=True)
             return None
 
     def get_open_orders(

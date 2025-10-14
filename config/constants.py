@@ -16,7 +16,7 @@ class TradingConstants:
 
     # === API Limits and Pagination ===
 
-    ORDER_HISTORY_LIMIT = 50       # Max orders to fetch from history
+    ORDER_HISTORY_LIMIT = 100      # Max orders to fetch from history (increased from 50)
     CLOSED_PNL_LIMIT = 20          # Max closed PnL records to fetch
     TRANSACTION_LOG_LIMIT = 50     # Max transaction log entries
 
