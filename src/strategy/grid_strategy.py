@@ -591,10 +591,11 @@ class GridStrategy:
             )
             
             if not orders:
-                self.logger.warning(
-                    f"[{self.symbol}] No order history available, cannot restore grid levels"
+                # FAIL-FAST: Cannot restore without order history
+                raise RuntimeError(
+                    f"[{self.symbol}] No order history available - cannot restore {side} position. "
+                    f"Manual intervention required: close position on exchange and restart bot."
                 )
-                return [(total_qty, 0.0, 0, None)]  # Fallback: single position at level 0
             
             # DEBUG: Log ALL orders to see actual format
             self.logger.info(f"[{self.symbol}] === DEBUG: First 10 orders from history ===")
@@ -673,10 +674,11 @@ class GridStrategy:
                 )
             
             if not current_position_orders:
-                self.logger.warning(
-                    f"[{self.symbol}] No position orders found after last TP, falling back to single level"
+                # FAIL-FAST: Cannot restore without position orders
+                raise RuntimeError(
+                    f"[{self.symbol}] No {side} position orders found after last TP - cannot restore. "
+                    f"Manual intervention required: close position on exchange and restart bot."
                 )
-                return [(total_qty, 0.0, 0, None)]
             
             # Reconstruct grid levels
             positions = []
@@ -722,17 +724,24 @@ class GridStrategy:
                         f"✅ [{self.symbol}] Quantity validation passed: restored={restored_qty}, exchange={total_qty}"
                     )
 
-            return positions if positions else [(total_qty, 0.0, 0, None)]
+            if not positions:
+                # FAIL-FAST: No valid positions reconstructed
+                raise RuntimeError(
+                    f"[{self.symbol}] Could not reconstruct any valid {side} positions from order history. "
+                    f"Manual intervention required: close position on exchange and restart bot."
+                )
+            
+            return positions
 
         except Exception as e:
             self.logger.error(
-                f"[{self.symbol}] Error restoring grid levels from order history: {e}"
+                f"[{self.symbol}] Error restoring grid levels from order history: {e}",
+                exc_info=True
             )
-            self.logger.warning(
-                f"[{self.symbol}] Using fallback: single aggregated position "
-                f"(qty={total_qty}, avgPrice=0.0). Grid level details lost."
-            )
-            return [(total_qty, 0.0, 0, None)]  # Fallback: avgPrice unknown, will sync on first update
+            # FAIL-FAST: Cannot restore positions
+            raise RuntimeError(
+                f"[{self.symbol}] Failed to restore {side} position from order history: {e}"
+            ) from e
 
     def _restore_position_from_exchange(self, side: str, exchange_position: dict):
         """
@@ -1868,45 +1877,25 @@ class GridStrategy:
 
                 if local_qty == 0:
                     # Position exists on exchange but not tracked locally
-                    # This happens on bot restart - restore from Position WebSocket snapshot
-                    self.logger.info(
-                        f"📥 [{self.symbol}] Restoring {side} position from Position WebSocket: "
-                        f"{size_float} @ ${avg_price}"
+                    # This should NEVER happen - positions should ONLY be restored via REST API in sync_with_exchange()
+                    # WebSocket should only update existing positions, not create new ones
+                    self.logger.error(
+                        f"❌ [{self.symbol}] Position mismatch: exchange has {side} position ({size_float} @ ${avg_price}) "
+                        f"but local tracking is empty. This indicates sync_with_exchange() failed or was skipped."
                     )
-
-                    # Restore position as single entry (grid_level=0)
-                    # Note: We lose grid level details, but exchange avgPrice is accurate
-                    self.pm.add_position(
-                        side=side,
-                        entry_price=float(avg_price) if avg_price else 0.0,
-                        quantity=size_float,
-                        grid_level=0,  # Restored position (no grid history)
-                        order_id=None  # Position WebSocket doesn't provide orderId
+                    
+                    # FAIL-FAST: Position should have been restored by REST API
+                    reason = (
+                        f"Position exists on exchange but not tracked locally for {side}: "
+                        f"exchange={size_float}, local=0. Position restoration should happen ONLY via REST API "
+                        f"in sync_with_exchange(), not from WebSocket. Restart bot to trigger proper sync."
                     )
-
-                    # Create TP order for restored position
-                    if not self.dry_run:
-                        try:
-                            self._update_tp_order(side)
-                            self.logger.info(
-                                f"✅ [{self.symbol}] {side} position restored and TP order created"
-                            )
-                        except Exception as e:
-                            self.logger.error(
-                                f"[{self.symbol}] Failed to create TP order for restored {side} position: {e}"
-                            )
-
-                    # Log to metrics
-                    if self.metrics_tracker:
-                        self.metrics_tracker.log_trade(
-                            symbol=self.symbol,
-                            side=side,
-                            action="RESTORE",
-                            price=float(avg_price) if avg_price else 0.0,
-                            quantity=size_float,
-                            reason="Position restored from WebSocket snapshot",
-                            pnl=None
-                        )
+                    
+                    # Create emergency stop flag
+                    self._create_emergency_stop_flag(reason)
+                    self.emergency_stopped = True
+                    
+                    raise RuntimeError(f"[{self.symbol}] {reason}")
 
                 # Update cumulative PnL tracking if provided
                 if cum_realised_pnl:
