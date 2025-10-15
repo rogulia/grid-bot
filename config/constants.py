@@ -16,7 +16,7 @@ class TradingConstants:
 
     # === API Limits and Pagination ===
 
-    ORDER_HISTORY_LIMIT = 100      # Max orders to fetch from history (increased from 50)
+    ORDER_HISTORY_LIMIT = 200      # Max orders to fetch from history (Bybit API max limit)
     CLOSED_PNL_LIMIT = 20          # Max closed PnL records to fetch
     TRANSACTION_LOG_LIMIT = 50     # Max transaction log entries
 
@@ -63,6 +63,34 @@ class TradingConstants:
     EMERGENCY_STOP_FILE_PREFIX = "."  # Hidden file prefix for emergency flags
 
 
+class ValidationLimits:
+    """Validation limits for strategy configuration"""
+
+    # Leverage limits
+    MIN_LEVERAGE = 1
+    MAX_LEVERAGE = 200
+
+    # Position size limits (USD)
+    MIN_POSITION_SIZE_USD = 0.1
+    MAX_POSITION_SIZE_USD = 100000.0
+
+    # Grid step limits (percent)
+    MIN_GRID_STEP_PCT = 0.01
+    MAX_GRID_STEP_PCT = 100.0
+
+    # Multiplier limits
+    MIN_MULTIPLIER = 1.0  # Exclusive lower bound
+    MAX_MULTIPLIER = 10.0
+
+    # Take profit limits (percent)
+    MIN_TP_PCT = 0.01
+    MAX_TP_PCT = 100.0
+
+    # Grid levels limits
+    MIN_GRID_LEVELS = 1
+    MAX_GRID_LEVELS = 50
+
+
 class LogMessages:
     """Standard log message templates"""
 
@@ -89,4 +117,4 @@ class LogMessages:
 
 
 # Export for easy importing
-__all__ = ['TradingConstants', 'LogMessages']
+__all__ = ['TradingConstants', 'ValidationLimits', 'LogMessages']

@@ -236,20 +236,20 @@ class TestSyncWithExchange:
     """Tests for sync_with_exchange"""
 
     def test_sync_opens_initial_positions(self, grid_strategy, mock_bybit_client, position_manager):
-        """Test that sync opens initial positions when none exist"""
+        """Test that restore opens initial positions when none exist"""
         # Mock: no positions on exchange
         mock_bybit_client.get_active_position.return_value = None
         grid_strategy.pm = position_manager
 
         # In dry_run mode
-        grid_strategy.sync_with_exchange(100.0)
+        grid_strategy.restore_state_from_exchange(100.0)
 
         # Should track initial positions
         assert position_manager.get_position_count('Buy') == 1
         assert position_manager.get_position_count('Sell') == 1
 
     def test_sync_restores_positions_from_exchange(self, grid_strategy, mock_bybit_client, position_manager):
-        """Test that sync restores positions from exchange"""
+        """Test that restore restores positions from exchange"""
         # Mock: Buy position exists on exchange, no Sell position
         def get_position_side_effect(symbol, side, category):
             if side == 'Buy':
@@ -267,13 +267,14 @@ class TestSyncWithExchange:
                 'cumExecQty': '0.5',  # Executed quantity (not 'qty')
                 'avgPrice': '100.0',
                 'orderStatus': 'Filled',
-                'createdTime': '1609459200000'
+                'createdTime': '1609459200000',
+                'reduceOnly': False  # Opening order
             }
         ]
 
         grid_strategy.pm = position_manager
 
-        grid_strategy.sync_with_exchange(100.0)
+        grid_strategy.restore_state_from_exchange(100.0)
 
         # Should restore Buy position from exchange
         assert position_manager.get_total_quantity('Buy') > 0
@@ -669,7 +670,8 @@ class TestOnOrderUpdate:
             'orderType': 'Market',
             'positionIdx': '1',  # LONG position
             'symbol': 'SOLUSDT',
-            'side': 'Sell'
+            'side': 'Sell',
+            'reduceOnly': True  # TP orders are reduce-only
         }
 
         grid_strategy.on_order_update(order_data)
@@ -689,7 +691,8 @@ class TestOnOrderUpdate:
             'orderType': 'Market',
             'positionIdx': '2',  # SHORT position
             'symbol': 'SOLUSDT',
-            'side': 'Buy'
+            'side': 'Buy',
+            'reduceOnly': True  # TP orders are reduce-only
         }
 
         grid_strategy.on_order_update(order_data)
@@ -709,7 +712,8 @@ class TestOnOrderUpdate:
             'orderType': 'Market',
             'positionIdx': '1',  # LONG position
             'symbol': 'SOLUSDT',
-            'side': 'Sell'
+            'side': 'Sell',
+            'reduceOnly': True  # TP orders are reduce-only
         }
 
         grid_strategy.on_order_update(order_data)
@@ -726,7 +730,8 @@ class TestOnOrderUpdate:
             'orderType': 'Market',
             'positionIdx': '1',
             'symbol': 'SOLUSDT',
-            'side': 'Sell'
+            'side': 'Sell',
+            'reduceOnly': True
         }
         grid_strategy.on_order_update(order_data_1)
         assert grid_strategy._tp_orders['Buy'] == 'order_1'
@@ -738,7 +743,8 @@ class TestOnOrderUpdate:
             'orderType': 'Market',
             'positionIdx': '2',
             'symbol': 'SOLUSDT',
-            'side': 'Buy'
+            'side': 'Buy',
+            'reduceOnly': True
         }
         grid_strategy.on_order_update(order_data_2)
         assert grid_strategy._tp_orders['Sell'] == 'order_2'
@@ -750,7 +756,8 @@ class TestOnOrderUpdate:
             'orderType': 'Market',
             'positionIdx': '1',
             'symbol': 'SOLUSDT',
-            'side': 'Sell'
+            'side': 'Sell',
+            'reduceOnly': True
         }
         grid_strategy.on_order_update(order_data_3)
         assert 'Buy' not in grid_strategy._tp_orders or grid_strategy._tp_orders['Buy'] is None
@@ -765,7 +772,8 @@ class TestOnOrderUpdate:
             'orderType': 'Market',
             'positionIdx': '1',
             'symbol': 'SOLUSDT',
-            'side': 'Sell'
+            'side': 'Sell',
+            'reduceOnly': True
         }
         grid_strategy.on_order_update(order_data_long)
         assert grid_strategy._tp_orders['Buy'] == 'long_order'
@@ -777,7 +785,8 @@ class TestOnOrderUpdate:
             'orderType': 'Market',
             'positionIdx': '2',
             'symbol': 'SOLUSDT',
-            'side': 'Buy'
+            'side': 'Buy',
+            'reduceOnly': True
         }
         grid_strategy.on_order_update(order_data_short)
         assert grid_strategy._tp_orders['Sell'] == 'short_order'

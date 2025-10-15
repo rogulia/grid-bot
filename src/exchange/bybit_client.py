@@ -544,7 +544,8 @@ class BybitClient:
         self,
         symbol: str,
         category: str = "linear",
-        limit: int = 50
+        limit: int = 50,
+        order_status: str = None
     ) -> List[Dict]:
         """
         Get order history (executed/cancelled orders)
@@ -554,7 +555,9 @@ class BybitClient:
         Args:
             symbol: Trading symbol (e.g., 'SOLUSDT')
             category: Market category (default: 'linear')
-            limit: Number of records to retrieve (default: 50, max: 50)
+            limit: Number of records to retrieve (default: 50, max: 200)
+            order_status: Filter by order status (e.g., 'Filled', 'Cancelled').
+                         If None, returns all statuses.
 
         Returns:
             List of order records, each containing:
@@ -575,19 +578,30 @@ class BybitClient:
         Example:
             >>> # Get recent order history for SOLUSDT
             >>> orders = client.get_order_history('SOLUSDT', limit=50)
-            >>> for order in orders:
+            >>>
+            >>> # Get only filled orders (for position restoration)
+            >>> filled_orders = client.get_order_history('SOLUSDT', order_status='Filled', limit=200)
+            >>> for order in filled_orders:
             ...     print(f"{order['side']} {order['qty']} @ {order['avgPrice']}")
         """
         try:
-            response = self.session.get_order_history(
-                category=category,
-                symbol=symbol,
-                limit=limit
-            )
+            # Build params dict
+            params = {
+                'category': category,
+                'symbol': symbol,
+                'limit': limit
+            }
+
+            # Add order_status filter if specified
+            if order_status:
+                params['orderStatus'] = order_status
+
+            response = self.session.get_order_history(**params)
 
             if response.get('retCode') == 0:
                 orders = response.get('result', {}).get('list', [])
-                self.logger.debug(f"Retrieved {len(orders)} order history records for {symbol}")
+                status_msg = f" (status={order_status})" if order_status else ""
+                self.logger.debug(f"Retrieved {len(orders)} order history records for {symbol}{status_msg}")
                 return orders
             else:
                 self.logger.error(f"Failed to get order history: {response}")

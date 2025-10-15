@@ -244,12 +244,13 @@ class TestSyncWithExchangeIntegration:
                 'cumExecQty': '0.5',  # Executed quantity (not 'qty')
                 'avgPrice': '100.0',
                 'orderStatus': 'Filled',
-                'createdTime': '1609459200000'
+                'createdTime': '1609459200000',
+                'reduceOnly': False  # Opening order
             }
         ]
 
-        # Sync with exchange
-        strategy.sync_with_exchange(100.0)
+        # Restore state from exchange
+        strategy.restore_state_from_exchange(100.0)
 
         # Should restore LONG position
         assert pm.get_total_quantity('Buy') > 0
@@ -270,8 +271,8 @@ class TestSyncWithExchangeIntegration:
         # Mock no positions on exchange
         mock_bybit_client.get_active_position.return_value = None
 
-        # Sync should open initial positions
-        strategy.sync_with_exchange(100.0)
+        # Restore should open initial positions
+        strategy.restore_state_from_exchange(100.0)
 
         # Both sides should have initial positions
         assert pm.get_position_count('Buy') == 1
