@@ -104,9 +104,6 @@ class TradingAccount:
         # Last log times for periodic logging
         self.last_log_times: Dict[str, float] = {}
 
-        # Initial sync flags (per symbol) - sync on first price update from WebSocket
-        self._initial_sync_done: Dict[str, bool] = {}
-
         # Account-level lock for atomicity (prevents race conditions in multi-symbol execution)
         # ONE lock per account protects all critical operations
         self._account_lock = threading.Lock()
@@ -230,6 +227,28 @@ class TradingAccount:
             file_prefix=f"{self.id_str}_"  # Files: 001_trades_history.csv, etc.
         )
 
+        # ⭐ Start Private WebSocket BEFORE restore to catch execution events
+        # This prevents race condition where restore opens positions but execution events are missed
+        if not self.dry_run:
+            try:
+                self.logger.info("🔐 Starting Private WebSocket for execution stream...")
+                self.private_ws = BybitPrivateWebSocket(
+                    api_key=self.api_key,
+                    api_secret=self.api_secret,
+                    execution_callback=self._on_execution,
+                    disconnect_callback=self._on_disconnect,
+                    demo=self.demo
+                )
+                self.private_ws.start()
+                self.logger.info("✅ Private WebSocket started successfully")
+            except Exception as e:
+                self.logger.error(f"❌ Failed to start Private WebSocket: {e}", exc_info=True)
+                raise RuntimeError(
+                    f"Account {self.id_str} cannot start without Private WebSocket"
+                ) from e
+        else:
+            self.logger.info("🔕 Dry run mode - Private WebSocket disabled")
+
         # Initialize each trading symbol
         for strategy_config in self.strategies_config:
             symbol = strategy_config['symbol']
@@ -282,10 +301,33 @@ class TradingAccount:
                 trading_account=self                 # ✅ Pass account reference for reserve checking
             )
 
-            # Mark that initial sync hasn't happened yet (will be done on first price update from WebSocket)
-            self._initial_sync_done[symbol] = False
-            self.logger.info(f"⏳ [{symbol}] Waiting for first price from WebSocket to perform initial sync...")
+            # ⭐ NEW ARCHITECTURE: Restore state from exchange BEFORE starting WebSockets
+            self.logger.info(f"🔄 [{symbol}] Restoring state from exchange...")
+            
+            # Get current market price via REST API
+            try:
+                if not self.dry_run:
+                    current_price = self.client.get_market_price(symbol, category)
+                    self.logger.info(f"💵 [{symbol}] Current market price: ${current_price:.4f}")
+                else:
+                    # Dry run: use placeholder price
+                    current_price = 100.0
+                    self.logger.info(f"[{symbol}] [DRY RUN] Using placeholder price: ${current_price:.4f}")
+                
+                # Restore positions, open initial positions if needed, create TP orders
+                self.strategies[symbol].restore_state_from_exchange(current_price)
+                self.logger.info(f"✅ [{symbol}] State restored successfully")
+                
+            except Exception as e:
+                self.logger.error(
+                    f"❌ [{symbol}] Failed to restore state from exchange: {e}",
+                    exc_info=True
+                )
+                raise RuntimeError(
+                    f"[{symbol}] Cannot start trading without restored state"
+                ) from e
 
+            # ⭐ NOW start WebSockets (after state is restored)
             # Create Position WebSocket for real-time position updates
             if not self.dry_run:
                 try:
@@ -362,27 +404,6 @@ class TradingAccount:
         self.logger.info(f"✅ Account {self.id_str} fully initialized with {len(self.strategies)} symbol(s)")
         self.logger.info("=" * 60)
 
-        # Start Private WebSocket for execution stream (FAIL-FAST if error)
-        if not self.dry_run:
-            try:
-                self.logger.info("🔐 Starting Private WebSocket for execution stream...")
-                self.private_ws = BybitPrivateWebSocket(
-                    api_key=self.api_key,
-                    api_secret=self.api_secret,
-                    execution_callback=self._on_execution,
-                    disconnect_callback=self._on_disconnect,
-                    demo=self.demo
-                )
-                self.private_ws.start()
-                self.logger.info("✅ Private WebSocket started successfully")
-            except Exception as e:
-                self.logger.error(f"❌ Failed to start Private WebSocket: {e}", exc_info=True)
-                raise RuntimeError(
-                    f"Account {self.id_str} cannot start without Private WebSocket"
-                ) from e
-        else:
-            self.logger.info("🔕 Dry run mode - Private WebSocket disabled")
-
     def _on_execution(self, exec_data: dict):
         """
         Handle execution event from Private WebSocket
@@ -456,13 +477,8 @@ class TradingAccount:
                 # Don't spam logs - emergency already logged
                 return
 
-            # Perform initial sync on first price update from WebSocket
-            if not self._initial_sync_done.get(symbol, True):
-                self.logger.info(f"💵 [{symbol}] First price from WebSocket: ${price:.4f}")
-                self.logger.info(f"🔄 [{symbol}] Performing initial sync with exchange...")
-                strategy.sync_with_exchange(price)
-                self._initial_sync_done[symbol] = True
-                self.logger.info(f"✅ [{symbol}] Initial sync completed")
+            # ⭐ State already restored in initialize() - no need for initial sync here!
+            # WebSocket just provides price updates for normal operation
 
             # Check Early Freeze trigger (Phase 2: Advanced Risk Management)
             # This runs BEFORE averaging checks in on_price_update()
@@ -494,8 +510,8 @@ class TradingAccount:
             last_log_time = self.last_log_times.get(symbol, 0)
 
             if current_time - last_log_time >= 60:
-                # NOTE: sync_with_exchange() removed - Private WebSocket now provides
-                # real-time execution data via on_execution() callback. No need for polling.
+                # Periodic sync to verify TP orders and catch untracked closes
+                strategy.sync_with_exchange(price)
 
                 # Calculate PnL
                 long_pnl = position_manager.calculate_pnl(price, 'Buy')

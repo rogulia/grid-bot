@@ -314,6 +314,33 @@ class BybitClient:
             self.logger.error(f"Error getting ticker: {e}")
             return None
 
+    def get_market_price(self, symbol: str, category: str = "linear") -> Optional[float]:
+        """
+        Get current market price (convenience method)
+
+        Args:
+            symbol: Trading symbol
+            category: Market category
+
+        Returns:
+            Current market price (lastPrice) or None if failed
+
+        Raises:
+            RuntimeError: If ticker data cannot be retrieved
+        """
+        ticker = self.get_ticker(symbol, category)
+        if not ticker:
+            raise RuntimeError(f"Failed to get ticker for {symbol}")
+
+        last_price = ticker.get('lastPrice')
+        if not last_price:
+            raise RuntimeError(f"Ticker for {symbol} missing lastPrice field")
+
+        try:
+            return float(last_price)
+        except (ValueError, TypeError) as e:
+            raise RuntimeError(f"Invalid price format for {symbol}: {last_price}") from e
+
     def place_tp_order(
         self,
         symbol: str,

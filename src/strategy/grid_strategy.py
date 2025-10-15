@@ -325,12 +325,16 @@ class GridStrategy:
             order_id = None
             if not self.dry_run:
                 try:
+                    # Determine position_idx for hedge mode
+                    position_idx = TradingConstants.POSITION_IDX_LONG if side == 'Buy' else TradingConstants.POSITION_IDX_SHORT
+                    
                     # Use limit order with retry mechanism
                     order_id = self.limit_order_manager.place_limit_order(
                         side=side,
                         qty=level_qty,
                         current_price=current_price,
-                        reason=f"Initial position level {grid_level}"
+                        reason=f"Initial position level {grid_level}",
+                        position_idx=position_idx
                     )
 
                     if not order_id:
@@ -343,7 +347,8 @@ class GridStrategy:
                             side=side,
                             qty=level_qty,
                             order_type="Market",
-                            category=self.category
+                            category=self.category,
+                            position_idx=position_idx
                         )
                         self.logger.debug(f"[{self.symbol}] Level {grid_level} market order response: {response}")
 
@@ -854,53 +859,49 @@ class GridStrategy:
             )
             raise  # Fail-fast - don't continue with broken state
 
-    def sync_with_exchange(self, current_price: float):
+    def restore_state_from_exchange(self, current_price: float):
         """
-        Sync local position state with exchange reality
+        Restore bot state from exchange at startup (called BEFORE WebSocket start)
 
-        **REST API Position Check (at startup only):**
-        - Uses get_active_position() REST API to fetch real position state from exchange
-        - Compares exchange quantity vs local quantity with strict tolerance (0.001)
-        - RESTORES positions if exchange has them but local tracking is empty
-        - OPENS initial positions if both exchange and local have none
-        - FAIL-FAST if unexplained mismatch detected (manual intervention required)
+        This is the FIRST step after bot initialization:
+        1. Fetch real position state from exchange via REST API (source of truth)
+        2. Compare with local state (should be empty at startup)
+        3. RESTORE positions if exchange has them (bot restart scenario)
+        4. OPEN initial positions if both exchange and local are empty
+        5. Create TP orders for all positions
+        6. FAIL-FAST if unexplained mismatch detected
 
-        **Position Restoration Flow (bot restart):**
-        1. Bot starts, sync_with_exchange() called on first price update
-        2. Fetch position from exchange via REST API (source of truth)
-        3. If exchange_qty > 0 and local_qty == 0 → RESTORE position
-        4. Create TP order for restored position
-        5. Continue normal trading via WebSocket
-
-        **During Normal Operation:**
-        - Execution WebSocket handles all position updates in real-time
-        - This method only runs periodically to verify TP orders exist
+        After this method completes successfully, WebSockets can be started safely.
 
         Args:
-            current_price: Current market price
-        """
-        # Block all operations if emergency stop was triggered
-        if self.emergency_stopped:
-            self.logger.warning(
-                f"⚠️  [{self.symbol}] Sync blocked: bot in emergency stop state. "
-                f"Fix issues and restart bot manually."
-            )
-            return
+            current_price: Current market price (from REST API get_market_price)
 
-        # Set syncing flag to block WebSocket updates during restoration
+        Raises:
+            RuntimeError: If state cannot be restored or critical mismatch detected
+        """
+        # Block if emergency stop was triggered
+        if self.emergency_stopped:
+            raise RuntimeError(
+                f"[{self.symbol}] Cannot restore state: bot in emergency stop state. "
+                f"Remove emergency stop flag and restart."
+            )
+
+        self.logger.info(f"🔄 [{self.symbol}] Restoring state from exchange @ ${current_price:.4f}...")
+
+        # Set syncing flag to prevent any race conditions
         with self._sync_lock:
             self._is_syncing = True
 
         try:
-            self.logger.debug(LogMessages.SYNC_START.format(symbol=self.symbol))
-
-            # Get available balance for initial position check (using BalanceManager)
+            # Get available balance for position checks
             available_balance = 0.0
             if not self.dry_run:
                 try:
                     available_balance = self.balance_manager.get_available_balance()
+                    self.logger.debug(f"[{self.symbol}] Available balance: ${available_balance:.2f}")
                 except Exception as e:
                     self.logger.error(f"[{self.symbol}] Failed to get balance: {e}")
+                    raise
 
             for side in ['Buy', 'Sell']:
                 # Get REAL position state from exchange (source of truth)
@@ -921,10 +922,10 @@ class GridStrategy:
                         self.logger.error(f"❌ [{self.symbol}] {reason}")
                         raise RuntimeError(f"[{self.symbol}] {reason}") from e
 
-                # Get local position state
+                # Get local position state (should be empty at startup!)
                 local_qty = self.pm.get_total_quantity(side)
 
-                # Calculate difference (strict tolerance for rounding only)
+                # Calculate difference
                 qty_diff = abs(exchange_qty - local_qty)
                 tolerance = 0.001  # Only rounding errors allowed
 
@@ -933,14 +934,13 @@ class GridStrategy:
                     f"exchange={exchange_qty}, local={local_qty}, diff={qty_diff:.6f}"
                 )
 
-                # Check scenario: no position on either side (open initial)
+                # SCENARIO 1: No positions anywhere - open initial
                 if exchange_qty == 0 and local_qty == 0:
-                    # OPEN: No position on exchange or locally - open initial position
                     self.logger.info(
                         f"🆕 [{self.symbol}] No {side} position exists - opening initial position"
                     )
 
-                    # Check balance before opening initial position
+                    # Check balance before opening
                     if not self.dry_run and available_balance < self.initial_size_usd:
                         reason = (
                             f"Insufficient balance to start trading: "
@@ -948,12 +948,8 @@ class GridStrategy:
                             f"available ${available_balance:.2f}"
                         )
                         self.logger.error(f"❌ [{self.symbol}] {reason}")
-
-                        # Create emergency stop flag
                         self._create_emergency_stop_flag(reason)
                         self.emergency_stopped = True
-
-                        # Stop bot - raise RuntimeError to prevent further operations
                         raise RuntimeError(f"[{self.symbol}] {reason}")
 
                     # Open initial position
@@ -966,16 +962,19 @@ class GridStrategy:
                     order_id = None
                     if not self.dry_run:
                         try:
-                            # Use limit order with retry mechanism
+                            position_idx = TradingConstants.POSITION_IDX_LONG if side == 'Buy' else TradingConstants.POSITION_IDX_SHORT
+                            
+                            # Use limit order with retry
                             order_id = self.limit_order_manager.place_limit_order(
                                 side=side,
                                 qty=initial_qty,
                                 current_price=current_price,
-                                reason="Initial position (sync)"
+                                reason="Initial position (restore)",
+                                position_idx=position_idx
                             )
 
                             if not order_id:
-                                # Limit order failed, fallback to market immediately
+                                # Fallback to market order
                                 self.logger.warning(
                                     f"[{self.symbol}] Limit order failed for initial {side}, using market order"
                                 )
@@ -984,12 +983,9 @@ class GridStrategy:
                                     side=side,
                                     qty=initial_qty,
                                     order_type="Market",
-                                    category=self.category
+                                    category=self.category,
+                                    position_idx=position_idx
                                 )
-
-                                self.logger.info(f"[{self.symbol}] Market order response: {response}")
-
-                                # Extract orderId from response
                                 if response and 'result' in response:
                                     order_id = response['result'].get('orderId')
 
@@ -1002,16 +998,14 @@ class GridStrategy:
                                 order_id=order_id
                             )
 
-                            # Create TP order for new position
-                            # Force cancel all reduce-only orders to ensure clean state
+                            # Create TP order
                             tp_id = self._update_tp_order(side, force_cancel_all=True)
                             if not tp_id:
-                                # Fail-fast: TP is critical for risk management
                                 raise RuntimeError(
-                                    f"Failed to create TP order for initial {side} position - place_tp_order returned None"
+                                    f"Failed to create TP order for initial {side} position"
                                 )
 
-                            # Log trade to metrics
+                            # Log trade
                             self.metrics_tracker.log_trade(
                                 timestamp=datetime.now(),
                                 symbol=self.symbol,
@@ -1019,7 +1013,7 @@ class GridStrategy:
                                 action='OPEN',
                                 price=current_price,
                                 quantity=initial_qty,
-                                reason='Initial position (sync)'
+                                reason='Initial position (restore)'
                             )
 
                         except Exception as e:
@@ -1027,7 +1021,7 @@ class GridStrategy:
                             self.logger.error(f"❌ [{self.symbol}] {reason}")
                             raise RuntimeError(f"[{self.symbol}] {reason}") from e
                     else:
-                        # Dry run: just track the position
+                        # Dry run
                         self.pm.add_position(
                             side=side,
                             entry_price=current_price,
@@ -1036,37 +1030,33 @@ class GridStrategy:
                             order_id=None
                         )
 
-                # Check if positions are synced (within tolerance)
+                # SCENARIO 2: Positions synced
                 elif qty_diff <= tolerance:
-                    # SYNCED: Exchange and local match
                     self.logger.info(
                         f"✅ [{self.symbol}] {side} position SYNCED: "
                         f"exchange={exchange_qty}, local={local_qty}"
                     )
 
-                    # Verify TP order exists (if position exists)
+                    # Create TP order if position exists but no TP
                     if local_qty > 0:
-                        with self._tp_orders_lock:
-                            tp_order_id = self._tp_orders.get(side) or self.pm.get_tp_order_id(side)
-
+                        tp_order_id = self.pm.get_tp_order_id(side)
                         if not tp_order_id and not self.dry_run:
-                            # TP order missing - create one
-                            self.logger.warning(
-                                f"⚠️  [{self.symbol}] TP order missing for {side} position (qty={local_qty}) - creating new one"
+                            self.logger.info(
+                                f"🎯 [{self.symbol}] Creating TP order for {side} position (qty={local_qty})"
                             )
                             self._update_tp_order(side)
 
+                # SCENARIO 3: Exchange has position, local empty - RESTORE
                 elif exchange_qty > 0 and local_qty == 0:
-                    # RESTORE: Exchange has position but local tracking is empty
                     self.logger.warning(
-                        f"📥 [{self.symbol}] Position mismatch detected for {side}: "
-                        f"exchange={exchange_qty}, local={local_qty} - RESTORING from exchange"
+                        f"📥 [{self.symbol}] Position found on exchange for {side}: "
+                        f"exchange={exchange_qty}, local={local_qty} - RESTORING"
                     )
 
                     if not self.dry_run:
                         self._restore_position_from_exchange(side, exchange_position)
                     else:
-                        # Dry run: just track the position
+                        # Dry run
                         self.pm.add_position(
                             side=side,
                             entry_price=current_price,
@@ -1075,6 +1065,94 @@ class GridStrategy:
                             order_id=None
                         )
 
+                # SCENARIO 4: Unexplained mismatch - FAIL-FAST
+                else:
+                    reason = (
+                        f"Position mismatch for {side} requires manual intervention: "
+                        f"exchange={exchange_qty}, local={local_qty}, diff={qty_diff:.6f}. "
+                        f"This may indicate: (1) positions opened outside bot, "
+                        f"(2) partial close, (3) exchange API issue. "
+                        f"Please verify positions on exchange and restart bot."
+                    )
+                    self.logger.error(f"❌ [{self.symbol}] {reason}")
+                    self._create_emergency_stop_flag(reason)
+                    self.emergency_stopped = True
+                    raise RuntimeError(f"[{self.symbol}] {reason}")
+
+            self.logger.info(f"✅ [{self.symbol}] State restored successfully from exchange")
+
+        finally:
+            # Clear syncing flag
+            with self._sync_lock:
+                self._is_syncing = False
+
+    def sync_with_exchange(self, current_price: float):
+        """
+        Periodic sync with exchange to handle edge cases
+
+        This method runs periodically (every 60s) during normal operation to:
+        1. Detect untracked closes (position closed on exchange but WebSocket missed it)
+        2. Verify TP orders exist for all positions
+        3. Handle adaptive reopen after untracked close
+
+        NOTE: This is NOT used for initial state restoration! 
+        Use restore_state_from_exchange() BEFORE starting WebSockets instead.
+
+        Args:
+            current_price: Current market price
+        """
+        # Block all operations if emergency stop was triggered
+        if self.emergency_stopped:
+            self.logger.debug(
+                f"[{self.symbol}] Sync skipped: bot in emergency stop state."
+            )
+            return
+
+        # Set syncing flag
+        with self._sync_lock:
+            self._is_syncing = True
+
+        try:
+            self.logger.debug(f"[{self.symbol}] Periodic sync with exchange...")
+
+            for side in ['Buy', 'Sell']:
+                # Get position state from exchange
+                exchange_position = None
+                exchange_qty = 0.0
+
+                if not self.dry_run:
+                    try:
+                        exchange_position = self.client.get_active_position(
+                            symbol=self.symbol,
+                            side=side,
+                            category=self.category
+                        )
+                        exchange_qty = float(exchange_position.get('size', 0)) if exchange_position else 0.0
+                    except Exception as e:
+                        self.logger.warning(f"[{self.symbol}] Failed to get {side} position: {e}")
+                        continue  # Skip this side, try next
+
+                # Get local position state
+                local_qty = self.pm.get_total_quantity(side)
+
+                # Calculate difference
+                qty_diff = abs(exchange_qty - local_qty)
+                tolerance = 0.001
+
+                # SCENARIO 1: Positions synced - verify TP order
+                if qty_diff <= tolerance:
+                    if local_qty > 0:
+                        # Verify TP order exists
+                        with self._tp_orders_lock:
+                            tp_order_id = self._tp_orders.get(side) or self.pm.get_tp_order_id(side)
+
+                        if not tp_order_id and not self.dry_run:
+                            self.logger.warning(
+                                f"⚠️  [{self.symbol}] TP order missing for {side} position (qty={local_qty}) - creating"
+                            )
+                            self._update_tp_order(side)
+
+                # SCENARIO 2: Untracked close detected
                 elif exchange_qty == 0 and local_qty > 0:
                     # UNTRACKED CLOSE: Position closed on exchange but not detected via WebSocket
                     self.logger.warning(
@@ -1146,23 +1224,14 @@ class GridStrategy:
                                 f"❌ [{self.symbol}] Failed to reopen {side} after untracked close: {e}"
                             )
 
+                # SCENARIO 3: Other mismatches - log warning (should have been caught at startup)
                 else:
-                    # FAIL-FAST: Unexplained mismatch (manual intervention required)
-                    reason = (
-                        f"Position mismatch for {side} requires manual intervention: "
+                    self.logger.warning(
+                        f"⚠️  [{self.symbol}] Position mismatch during periodic sync for {side}: "
                         f"exchange={exchange_qty}, local={local_qty}, diff={qty_diff:.6f}. "
-                        f"This may indicate: (1) positions opened outside bot, "
-                        f"(2) partial close not tracked, (3) exchange API issue. "
-                        f"Please verify positions on exchange and restart bot."
+                        f"This might indicate manual intervention or API lag. "
+                        f"If persists, restart bot."
                     )
-                    self.logger.error(f"❌ [{self.symbol}] {reason}")
-
-                    # Create emergency stop flag
-                    self._create_emergency_stop_flag(reason)
-                    self.emergency_stopped = True
-
-                    # Stop bot - raise RuntimeError to prevent further operations
-                    raise RuntimeError(f"[{self.symbol}] {reason}")
 
             # Log MM Rate once per sync (every 60s) - critical safety metric (using BalanceManager)
             if not self.dry_run:
@@ -1766,12 +1835,16 @@ class GridStrategy:
             # Execute order (or simulate)
             order_id = None
             if not self.dry_run:
+                # Determine position_idx for hedge mode
+                position_idx = TradingConstants.POSITION_IDX_LONG if side == 'Buy' else TradingConstants.POSITION_IDX_SHORT
+                
                 # Use limit order with retry mechanism
                 order_id = self.limit_order_manager.place_limit_order(
                     side=side,
                     qty=new_size,
                     current_price=current_price,
-                    reason=f"Grid level {grid_level}"
+                    reason=f"Grid level {grid_level}",
+                    position_idx=position_idx
                 )
 
                 if not order_id:
@@ -1784,7 +1857,8 @@ class GridStrategy:
                         side=side,
                         qty=new_size,
                         order_type="Market",
-                        category=self.category
+                        category=self.category,
+                        position_idx=position_idx
                     )
                     self.logger.info(f"[{self.symbol}] Market order response: {response}")
 
