@@ -1,0 +1,75 @@
+---
+globs: docs/*.md,*.md
+---
+
+# Documentation Guidelines
+
+## Documentation Structure
+
+Comprehensive docs in `docs/` directory:
+
+1. [docs/01-getting-started.md](mdc:docs/01-getting-started.md) - Installation and setup
+2. [docs/02-strategy.md](mdc:docs/02-strategy.md) - Trading strategy explanation
+3. [docs/03-configuration.md](mdc:docs/03-configuration.md) - Config parameters
+4. [docs/04-risk-management.md](mdc:docs/04-risk-management.md) - 7-phase risk system
+5. [docs/05-operations.md](mdc:docs/05-operations.md) - Production deployment
+6. [docs/06-analytics.md](mdc:docs/06-analytics.md) - Performance analysis
+7. [docs/07-multi-symbol.md](mdc:docs/07-multi-symbol.md) - Multi-symbol trading
+8. [docs/08-architecture.md](mdc:docs/08-architecture.md) - Technical architecture
+9. [docs/09-development.md](mdc:docs/09-development.md) - Development guide
+10. [docs/10-faq.md](mdc:docs/10-faq.md) - FAQ
+
+## Special Documentation
+
+- [CLAUDE.md](mdc:CLAUDE.md) - Technical specification for AI assistants
+- [README.md](mdc:README.md) - Main project README (Russian)
+- [QUICK_START_LIMIT_ORDERS.md](mdc:QUICK_START_LIMIT_ORDERS.md) - Limit orders guide
+- [IMPLEMENTATION_SUMMARY.md](mdc:IMPLEMENTATION_SUMMARY.md) - Implementation notes
+
+## Documentation Language
+
+- Main docs: Russian (project owner preference)
+- Code comments: English
+- Docstrings: English
+- Inline comments: English
+
+## Risk Warnings
+
+ALWAYS include risk warnings in documentation:
+- High leverage risks
+- Martingale progression risks
+- Cross margin liquidation risks
+- Demo testing recommendations
+
+## Code Examples
+
+Use real config examples with conservative parameters:
+```yaml
+leverage: 15                    # Conservative, not 75
+grid_step_percent: 2.5         # Wider, not 1.0
+averaging_multiplier: 1.4      # Lower, not 2.0
+```
+
+## Version Documentation
+
+When making significant changes:
+- Update relevant docs in `docs/`
+- Update CLAUDE.md if architecture changes
+- Add notes to IMPLEMENTATION_SUMMARY.md
+- Update README.md if user-facing changes
+
+## Diagrams and Tables
+
+Use markdown tables for:
+- Martingale progression examples
+- Risk phase comparisons
+- Parameter recommendations
+- File naming conventions
+
+## External Links
+
+Include links to:
+- Bybit API documentation
+- Demo trading signup
+- System requirements
+- Dependencies documentation

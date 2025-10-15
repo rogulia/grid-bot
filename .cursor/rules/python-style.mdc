@@ -1,0 +1,76 @@
+---
+globs: *.py
+---
+
+# Python Code Style for SOL-Trader
+
+## Imports
+
+- Use absolute imports from project root: `from src.utils.logger import log_trade`
+- Group imports: standard library → third-party → local imports
+- Use `TYPE_CHECKING` for circular dependency hints:
+  ```python
+  from typing import TYPE_CHECKING
+  if TYPE_CHECKING:
+      from ..analytics.metrics_tracker import MetricsTracker
+  ```
+
+## Docstrings
+
+- Use triple-quoted docstrings for all classes and public methods
+- Include Args, Returns, and Raises sections when applicable
+- Example:
+  ```python
+  def calculate_position_size(self, price: float, leverage: int) -> float:
+      """
+      Calculate position size based on margin and leverage
+      
+      Args:
+          price: Current market price
+          leverage: Trading leverage (e.g. 75)
+          
+      Returns:
+          Position size in USD
+          
+      Raises:
+          ValueError: If price or leverage is invalid
+      """
+  ```
+
+## Type Hints
+
+- Always use type hints for function parameters and return values
+- Use `Optional[T]` for nullable types
+- Use `Dict`, `List`, `Tuple` from `typing` for Python 3.9 compatibility
+
+## Error Handling
+
+- Follow fail-fast philosophy: raise exceptions for critical errors
+- Don't use default fallback values for critical data (price, balance, etc.)
+- Log errors with appropriate level (ERROR for critical, WARNING for recoverable)
+- Use try-except only when you can meaningfully handle the error
+
+## Logging
+
+- Use the logger from constructor (injected dependency)
+- Always include account ID in logs: `f"[{self.id_str}]"`
+- Log levels:
+  - DEBUG: Detailed flow information
+  - INFO: Important state changes, trades
+  - WARNING: Recoverable issues, risk warnings
+  - ERROR: Unrecoverable errors
+- Use f-strings for log messages
+
+## Constants
+
+- Define all magic numbers in [config/constants.py](mdc:config/constants.py)
+- Reference via `TradingConstants.CONSTANT_NAME`
+- Never hardcode fees, timeouts, or thresholds in business logic
+
+## Multi-Account Pattern
+
+When creating components that work with accounts:
+- Accept `account_id: int` in constructor
+- Create zero-padded ID string: `self.id_str = f"{account_id:03d}"`
+- Accept optional `account_logger: Optional[logging.Logger]` for per-account logging
+- Use injected logger or fallback: `self.logger = account_logger or logging.getLogger("module.name")`

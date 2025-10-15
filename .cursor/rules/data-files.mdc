@@ -1,0 +1,100 @@
+---
+globs: data/*.json,data/*.csv
+---
+
+# Data Files and State Management
+
+## Bot State File
+
+File: `data/{account_id}_bot_state.json`
+
+Structure:
+```json
+{
+  "account_id": 1,
+  "symbol": "DOGEUSDT",
+  "long_position": {
+    "avg_price": 0.10,
+    "quantity": 750.0,
+    "realized_pnl": 0.0,
+    "grid_level": 0
+  },
+  "short_position": {
+    "avg_price": 0.10,
+    "quantity": 750.0,
+    "realized_pnl": 0.0,
+    "grid_level": 0
+  },
+  "last_updated": "2025-10-15T10:30:45"
+}
+```
+
+## Performance Metrics CSV
+
+File: `data/{account_id}_performance_metrics_{date}.csv`
+
+Columns:
+- timestamp
+- account_id
+- symbol
+- total_realized_pnl
+- total_trades
+- win_rate
+- avg_profit
+- max_drawdown
+- current_balance
+
+## Trade History CSV
+
+File: `data/{account_id}_trades_history_{date}.csv`
+
+Columns:
+- timestamp
+- account_id
+- symbol
+- side (Buy/Sell)
+- position_idx (1=LONG, 2=SHORT)
+- quantity
+- price
+- realized_pnl
+- fee
+- order_type (Market/Limit)
+
+## Emergency Stop Flag
+
+File: `data/.{account_id}_emergency_stop`
+
+Content: Plain text reason for emergency stop
+- Created by EmergencyStopManager
+- Checked before every operation
+- Must be manually removed after investigation
+
+## State Persistence
+
+Use [StateManager](mdc:src/core/state_manager.py) for all file operations:
+```python
+state_manager.save_state({
+    "account_id": self.account_id,
+    "symbol": self.symbol,
+    ...
+})
+```
+
+## File Locking
+
+- StateManager uses file locks for thread safety
+- Never write to state files directly
+- Always use StateManager methods
+
+## Data Directories
+
+Created automatically on first run:
+- `data/` - State files, metrics, trade history
+- `logs/` - Log files (rotating daily)
+
+## File Cleanup
+
+Old files are NOT automatically cleaned:
+- Manual cleanup of old logs/metrics
+- Keep state files for recovery
+- Trade history is permanent (for analytics)

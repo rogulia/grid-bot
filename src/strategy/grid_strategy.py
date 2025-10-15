@@ -120,6 +120,10 @@ class GridStrategy:
         self._tp_orders_lock = threading.Lock()
         self._pnl_lock = threading.Lock()
 
+        # Syncing flag - prevents WebSocket position updates during initial sync
+        self._is_syncing = False
+        self._sync_lock = threading.Lock()
+
         # Track cumulative realized PnL for each side (to calculate delta on position close)
         self._last_cum_realised_pnl = {'Buy': 0.0, 'Sell': 0.0}
 
@@ -880,60 +884,202 @@ class GridStrategy:
             )
             return
 
-        self.logger.debug(LogMessages.SYNC_START.format(symbol=self.symbol))
+        # Set syncing flag to block WebSocket updates during restoration
+        with self._sync_lock:
+            self._is_syncing = True
 
-        # Get available balance for initial position check (using BalanceManager)
-        available_balance = 0.0
-        if not self.dry_run:
-            try:
-                available_balance = self.balance_manager.get_available_balance()
-            except Exception as e:
-                self.logger.error(f"[{self.symbol}] Failed to get balance: {e}")
+        try:
+            self.logger.debug(LogMessages.SYNC_START.format(symbol=self.symbol))
 
-        for side in ['Buy', 'Sell']:
-            # Get REAL position state from exchange (source of truth)
-            exchange_position = None
-            exchange_qty = 0.0
-
+            # Get available balance for initial position check (using BalanceManager)
+            available_balance = 0.0
             if not self.dry_run:
                 try:
-                    exchange_position = self.client.get_active_position(
-                        symbol=self.symbol,
-                        side=side,
-                        category=self.category
-                    )
-                    exchange_qty = float(exchange_position.get('size', 0)) if exchange_position else 0.0
+                    available_balance = self.balance_manager.get_available_balance()
                 except Exception as e:
-                    # Fail-fast: cannot verify exchange state
-                    reason = f"Failed to get {side} position from exchange: {e}"
-                    self.logger.error(f"❌ [{self.symbol}] {reason}")
-                    raise RuntimeError(f"[{self.symbol}] {reason}") from e
+                    self.logger.error(f"[{self.symbol}] Failed to get balance: {e}")
 
-            # Get local position state
-            local_qty = self.pm.get_total_quantity(side)
+            for side in ['Buy', 'Sell']:
+                # Get REAL position state from exchange (source of truth)
+                exchange_position = None
+                exchange_qty = 0.0
 
-            # Calculate difference (strict tolerance for rounding only)
-            qty_diff = abs(exchange_qty - local_qty)
-            tolerance = 0.001  # Only rounding errors allowed
+                if not self.dry_run:
+                    try:
+                        exchange_position = self.client.get_active_position(
+                            symbol=self.symbol,
+                            side=side,
+                            category=self.category
+                        )
+                        exchange_qty = float(exchange_position.get('size', 0)) if exchange_position else 0.0
+                    except Exception as e:
+                        # Fail-fast: cannot verify exchange state
+                        reason = f"Failed to get {side} position from exchange: {e}"
+                        self.logger.error(f"❌ [{self.symbol}] {reason}")
+                        raise RuntimeError(f"[{self.symbol}] {reason}") from e
 
-            self.logger.debug(
-                f"[{self.symbol}] {side} position check: "
-                f"exchange={exchange_qty}, local={local_qty}, diff={qty_diff:.6f}"
-            )
+                # Get local position state
+                local_qty = self.pm.get_total_quantity(side)
 
-            # Check scenario: no position on either side (open initial)
-            if exchange_qty == 0 and local_qty == 0:
-                # OPEN: No position on exchange or locally - open initial position
-                self.logger.info(
-                    f"🆕 [{self.symbol}] No {side} position exists - opening initial position"
+                # Calculate difference (strict tolerance for rounding only)
+                qty_diff = abs(exchange_qty - local_qty)
+                tolerance = 0.001  # Only rounding errors allowed
+
+                self.logger.debug(
+                    f"[{self.symbol}] {side} position check: "
+                    f"exchange={exchange_qty}, local={local_qty}, diff={qty_diff:.6f}"
                 )
 
-                # Check balance before opening initial position
-                if not self.dry_run and available_balance < self.initial_size_usd:
+                # Check scenario: no position on either side (open initial)
+                if exchange_qty == 0 and local_qty == 0:
+                    # OPEN: No position on exchange or locally - open initial position
+                    self.logger.info(
+                        f"🆕 [{self.symbol}] No {side} position exists - opening initial position"
+                    )
+
+                    # Check balance before opening initial position
+                    if not self.dry_run and available_balance < self.initial_size_usd:
+                        reason = (
+                            f"Insufficient balance to start trading: "
+                            f"need ${self.initial_size_usd:.2f} MARGIN for initial position, "
+                            f"available ${available_balance:.2f}"
+                        )
+                        self.logger.error(f"❌ [{self.symbol}] {reason}")
+
+                        # Create emergency stop flag
+                        self._create_emergency_stop_flag(reason)
+                        self.emergency_stopped = True
+
+                        # Stop bot - raise RuntimeError to prevent further operations
+                        raise RuntimeError(f"[{self.symbol}] {reason}")
+
+                    # Open initial position
+                    initial_qty = self._usd_to_qty(self.initial_size_usd, current_price)
+                    self.logger.info(
+                        f"🆕 [{self.symbol}] Opening initial {side} position: ${self.initial_size_usd} "
+                        f"({initial_qty:.6f} {self.symbol}) @ ${current_price:.4f}"
+                    )
+
+                    order_id = None
+                    if not self.dry_run:
+                        try:
+                            # Use limit order with retry mechanism
+                            order_id = self.limit_order_manager.place_limit_order(
+                                side=side,
+                                qty=initial_qty,
+                                current_price=current_price,
+                                reason="Initial position (sync)"
+                            )
+
+                            if not order_id:
+                                # Limit order failed, fallback to market immediately
+                                self.logger.warning(
+                                    f"[{self.symbol}] Limit order failed for initial {side}, using market order"
+                                )
+                                response = self.client.place_order(
+                                    symbol=self.symbol,
+                                    side=side,
+                                    qty=initial_qty,
+                                    order_type="Market",
+                                    category=self.category
+                                )
+
+                                self.logger.info(f"[{self.symbol}] Market order response: {response}")
+
+                                # Extract orderId from response
+                                if response and 'result' in response:
+                                    order_id = response['result'].get('orderId')
+
+                            # Track position locally
+                            self.pm.add_position(
+                                side=side,
+                                entry_price=current_price,
+                                quantity=initial_qty,
+                                grid_level=0,
+                                order_id=order_id
+                            )
+
+                            # Create TP order for new position
+                            # Force cancel all reduce-only orders to ensure clean state
+                            tp_id = self._update_tp_order(side, force_cancel_all=True)
+                            if not tp_id:
+                                # Fail-fast: TP is critical for risk management
+                                raise RuntimeError(
+                                    f"Failed to create TP order for initial {side} position - place_tp_order returned None"
+                                )
+
+                            # Log trade to metrics
+                            self.metrics_tracker.log_trade(
+                                timestamp=datetime.now(),
+                                symbol=self.symbol,
+                                side=side,
+                                action='OPEN',
+                                price=current_price,
+                                quantity=initial_qty,
+                                reason='Initial position (sync)'
+                            )
+
+                        except Exception as e:
+                            reason = f"Failed to open initial {side} position: {e}"
+                            self.logger.error(f"❌ [{self.symbol}] {reason}")
+                            raise RuntimeError(f"[{self.symbol}] {reason}") from e
+                    else:
+                        # Dry run: just track the position
+                        self.pm.add_position(
+                            side=side,
+                            entry_price=current_price,
+                            quantity=initial_qty,
+                            grid_level=0,
+                            order_id=None
+                        )
+
+                # Check if positions are synced (within tolerance)
+                elif qty_diff <= tolerance:
+                    # SYNCED: Exchange and local match
+                    self.logger.info(
+                        f"✅ [{self.symbol}] {side} position SYNCED: "
+                        f"exchange={exchange_qty}, local={local_qty}"
+                    )
+
+                    # Verify TP order exists (if position exists)
+                    if local_qty > 0:
+                        with self._tp_orders_lock:
+                            tp_order_id = self._tp_orders.get(side) or self.pm.get_tp_order_id(side)
+
+                        if not tp_order_id and not self.dry_run:
+                            # TP order missing - create one
+                            self.logger.warning(
+                                f"⚠️  [{self.symbol}] TP order missing for {side} position (qty={local_qty}) - creating new one"
+                            )
+                            self._update_tp_order(side)
+
+                elif exchange_qty > 0 and local_qty == 0:
+                    # RESTORE: Exchange has position but local tracking is empty
+                    self.logger.warning(
+                        f"📥 [{self.symbol}] Position mismatch detected for {side}: "
+                        f"exchange={exchange_qty}, local={local_qty} - RESTORING from exchange"
+                    )
+
+                    if not self.dry_run:
+                        self._restore_position_from_exchange(side, exchange_position)
+                    else:
+                        # Dry run: just track the position
+                        self.pm.add_position(
+                            side=side,
+                            entry_price=current_price,
+                            quantity=exchange_qty,
+                            grid_level=0,
+                            order_id=None
+                        )
+
+                else:
+                    # FAIL-FAST: Unexplained mismatch (manual intervention required)
                     reason = (
-                        f"Insufficient balance to start trading: "
-                        f"need ${self.initial_size_usd:.2f} MARGIN for initial position, "
-                        f"available ${available_balance:.2f}"
+                        f"Position mismatch for {side} requires manual intervention: "
+                        f"exchange={exchange_qty}, local={local_qty}, diff={qty_diff:.6f}. "
+                        f"This may indicate: (1) positions opened outside bot, "
+                        f"(2) partial close not tracked, (3) exchange API issue. "
+                        f"Please verify positions on exchange and restart bot."
                     )
                     self.logger.error(f"❌ [{self.symbol}] {reason}")
 
@@ -944,166 +1090,33 @@ class GridStrategy:
                     # Stop bot - raise RuntimeError to prevent further operations
                     raise RuntimeError(f"[{self.symbol}] {reason}")
 
-                # Open initial position
-                initial_qty = self._usd_to_qty(self.initial_size_usd, current_price)
-                self.logger.info(
-                    f"🆕 [{self.symbol}] Opening initial {side} position: ${self.initial_size_usd} "
-                    f"({initial_qty:.6f} {self.symbol}) @ ${current_price:.4f}"
-                )
+            # Log MM Rate once per sync (every 60s) - critical safety metric (using BalanceManager)
+            if not self.dry_run:
+                try:
+                    available_balance = self.balance_manager.get_available_balance()
+                    account_mm_rate = self.balance_manager.get_mm_rate()
 
-                order_id = None
-                if not self.dry_run:
-                    try:
-                        # Use limit order with retry mechanism
-                        order_id = self.limit_order_manager.place_limit_order(
-                            side=side,
-                            qty=initial_qty,
-                            current_price=current_price,
-                            reason="Initial position (sync)"
-                        )
-
-                        if not order_id:
-                            # Limit order failed, fallback to market immediately
-                            self.logger.warning(
-                                f"[{self.symbol}] Limit order failed for initial {side}, using market order"
-                            )
-                            response = self.client.place_order(
+                    if account_mm_rate is not None:
+                        self.logger.info(
+                            LogMessages.BALANCE_UPDATE.format(
                                 symbol=self.symbol,
-                                side=side,
-                                qty=initial_qty,
-                                order_type="Market",
-                                category=self.category
+                                balance=available_balance,
+                                mm_rate=account_mm_rate
                             )
-
-                            self.logger.info(f"[{self.symbol}] Market order response: {response}")
-
-                            # Extract orderId from response
-                            if response and 'result' in response:
-                                order_id = response['result'].get('orderId')
-
-                        # Track position locally
-                        self.pm.add_position(
-                            side=side,
-                            entry_price=current_price,
-                            quantity=initial_qty,
-                            grid_level=0,
-                            order_id=order_id
                         )
-
-                        # Create TP order for new position
-                        # Force cancel all reduce-only orders to ensure clean state
-                        tp_id = self._update_tp_order(side, force_cancel_all=True)
-                        if not tp_id:
-                            # Fail-fast: TP is critical for risk management
-                            raise RuntimeError(
-                                f"Failed to create TP order for initial {side} position - place_tp_order returned None"
+                    else:
+                        self.logger.info(
+                            LogMessages.BALANCE_ONLY.format(
+                                symbol=self.symbol,
+                                balance=available_balance
                             )
-
-                        # Log trade to metrics
-                        self.metrics_tracker.log_trade(
-                            timestamp=datetime.now(),
-                            symbol=self.symbol,
-                            side=side,
-                            action='OPEN',
-                            price=current_price,
-                            quantity=initial_qty,
-                            reason='Initial position (sync)'
                         )
-
-                    except Exception as e:
-                        reason = f"Failed to open initial {side} position: {e}"
-                        self.logger.error(f"❌ [{self.symbol}] {reason}")
-                        raise RuntimeError(f"[{self.symbol}] {reason}") from e
-                else:
-                    # Dry run: just track the position
-                    self.pm.add_position(
-                        side=side,
-                        entry_price=current_price,
-                        quantity=initial_qty,
-                        grid_level=0,
-                        order_id=None
-                    )
-
-            # Check if positions are synced (within tolerance)
-            elif qty_diff <= tolerance:
-                # SYNCED: Exchange and local match
-                self.logger.info(
-                    f"✅ [{self.symbol}] {side} position SYNCED: "
-                    f"exchange={exchange_qty}, local={local_qty}"
-                )
-
-                # Verify TP order exists (if position exists)
-                if local_qty > 0:
-                    with self._tp_orders_lock:
-                        tp_order_id = self._tp_orders.get(side) or self.pm.get_tp_order_id(side)
-
-                    if not tp_order_id and not self.dry_run:
-                        # TP order missing - create one
-                        self.logger.warning(
-                            f"⚠️  [{self.symbol}] TP order missing for {side} position (qty={local_qty}) - creating new one"
-                        )
-                        self._update_tp_order(side)
-
-            elif exchange_qty > 0 and local_qty == 0:
-                # RESTORE: Exchange has position but local tracking is empty
-                self.logger.warning(
-                    f"📥 [{self.symbol}] Position mismatch detected for {side}: "
-                    f"exchange={exchange_qty}, local={local_qty} - RESTORING from exchange"
-                )
-
-                if not self.dry_run:
-                    self._restore_position_from_exchange(side, exchange_position)
-                else:
-                    # Dry run: just track the position
-                    self.pm.add_position(
-                        side=side,
-                        entry_price=current_price,
-                        quantity=exchange_qty,
-                        grid_level=0,
-                        order_id=None
-                    )
-
-            else:
-                # FAIL-FAST: Unexplained mismatch (manual intervention required)
-                reason = (
-                    f"Position mismatch for {side} requires manual intervention: "
-                    f"exchange={exchange_qty}, local={local_qty}, diff={qty_diff:.6f}. "
-                    f"This may indicate: (1) positions opened outside bot, "
-                    f"(2) partial close not tracked, (3) exchange API issue. "
-                    f"Please verify positions on exchange and restart bot."
-                )
-                self.logger.error(f"❌ [{self.symbol}] {reason}")
-
-                # Create emergency stop flag
-                self._create_emergency_stop_flag(reason)
-                self.emergency_stopped = True
-
-                # Stop bot - raise RuntimeError to prevent further operations
-                raise RuntimeError(f"[{self.symbol}] {reason}")
-
-        # Log MM Rate once per sync (every 60s) - critical safety metric (using BalanceManager)
-        if not self.dry_run:
-            try:
-                available_balance = self.balance_manager.get_available_balance()
-                account_mm_rate = self.balance_manager.get_mm_rate()
-
-                if account_mm_rate is not None:
-                    self.logger.info(
-                        LogMessages.BALANCE_UPDATE.format(
-                            symbol=self.symbol,
-                            balance=available_balance,
-                            mm_rate=account_mm_rate
-                        )
-                    )
-                else:
-                    self.logger.info(
-                        LogMessages.BALANCE_ONLY.format(
-                            symbol=self.symbol,
-                            balance=available_balance
-                        )
-                    )
-            except Exception as e:
-                self.logger.warning(f"[{self.symbol}] Could not log balance/MM Rate: {e}")
+                except Exception as e:
+                    self.logger.warning(f"[{self.symbol}] Could not log balance/MM Rate: {e}")
+        finally:
+            # Clear syncing flag
+            with self._sync_lock:
+                self._is_syncing = False
 
     def on_execution(self, exec_data: dict):
         """
@@ -1954,6 +1967,18 @@ class GridStrategy:
                 local_qty = self.pm.get_total_quantity(side)
 
                 if local_qty == 0:
+                    # Check if we're currently syncing
+                    with self._sync_lock:
+                        is_syncing = self._is_syncing
+                    
+                    if is_syncing:
+                        # Ignore this update - sync_with_exchange() will handle restoration via REST API
+                        self.logger.debug(
+                            f"[{self.symbol}] Ignoring WebSocket position update during sync: "
+                            f"{side} size={size_float} (restoration in progress)"
+                        )
+                        return
+                    
                     # Position exists on exchange but not tracked locally
                     # This should NEVER happen - positions should ONLY be restored via REST API in sync_with_exchange()
                     # WebSocket should only update existing positions, not create new ones

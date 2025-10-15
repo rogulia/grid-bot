@@ -1,0 +1,62 @@
+---
+alwaysApply: true
+---
+
+# SOL-Trader Project Architecture
+
+This is an automated trading bot for Bybit futures with grid strategy and multi-account support.
+
+## Project Structure
+
+- **Entry point**: [src/main.py](mdc:src/main.py) - Multi-account orchestrator
+- **Core**: [src/core/](mdc:src/core/) - Multi-account bot, trading accounts, state management
+- **Exchange**: [src/exchange/](mdc:src/exchange/) - Bybit API client (HTTP + WebSocket)
+- **Strategy**: [src/strategy/](mdc:src/strategy/) - Grid strategy implementation and position manager
+- **Utils**: [src/utils/](mdc:src/utils/) - Balance manager, logger, emergency stop, limit order manager
+- **Analytics**: [src/analytics/](mdc:src/analytics/) - Metrics tracking
+- **Config**: [config/config.yaml](mdc:config/config.yaml) - Multi-account configuration
+- **Constants**: [config/constants.py](mdc:config/constants.py) - Trading constants, fees, limits
+
+## Key Architecture Principles
+
+1. **Multi-Account Isolation**: Each account has complete data isolation:
+   - Per-account log files: `logs/{account_id}_bot_YYYY-MM-DD.log`
+   - Per-account state files: `data/{account_id}_bot_state.json`
+   - Per-account metrics: `data/{account_id}_performance_metrics.csv`
+
+2. **WebSocket-First Architecture**: 
+   - Minimize REST API calls
+   - Real-time position updates via WebSocket
+   - Wallet updates via WebSocket
+   - Order and execution updates via WebSocket
+
+3. **Thread Safety**: All shared resources use locks
+   - Balance manager has thread-safe caching
+   - State manager uses locks for file operations
+   - Position manager protects shared state
+
+4. **Fail-Fast Philosophy**: No fallback values for critical data
+   - Symbol must be specified in config (no defaults)
+   - Explicit error handling for API failures
+   - Emergency stop on critical errors
+
+5. **Account ID Convention**: 
+   - Zero-padded 3-digit format: `001`, `002`, `003`, `004`
+   - Used consistently in filenames, logs, and state
+
+## File Naming Conventions
+
+- Logs: `{account_id}_{type}_{date}.log` (e.g., `001_bot_2025-10-15.log`)
+- State: `{account_id}_bot_state.json`
+- Metrics: `{account_id}_performance_metrics_{date}.csv`
+- Trades: `{account_id}_trades_history_{date}.csv`
+- Emergency stop flag: `.{account_id}_emergency_stop`
+
+## Critical Components
+
+- **TradingAccount** ([src/core/trading_account.py](mdc:src/core/trading_account.py)): Manages one account with multiple strategies
+- **GridStrategy** ([src/strategy/grid_strategy.py](mdc:src/strategy/grid_strategy.py)): Dual-sided LONG/SHORT grid trading
+- **PositionManager** ([src/strategy/position_manager.py](mdc:src/strategy/position_manager.py)): Position state and calculations
+- **BalanceManager** ([src/utils/balance_manager.py](mdc:src/utils/balance_manager.py)): Thread-safe balance/MM rate caching
+- **LimitOrderManager** ([src/utils/limit_order_manager.py](mdc:src/utils/limit_order_manager.py)): Smart limit order placement with retries
+- **EmergencyStopManager** ([src/utils/emergency_stop_manager.py](mdc:src/utils/emergency_stop_manager.py)): 7-phase risk management system

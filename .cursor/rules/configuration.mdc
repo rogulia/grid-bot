@@ -1,0 +1,117 @@
+---
+globs: config/*.yaml,config/*.py
+---
+
+# Configuration Management
+
+## Config File Structure
+
+Main config: [config/config.yaml](mdc:config/config.yaml)
+
+```yaml
+accounts:
+  - id: 1                            # Unique account ID (integer)
+    name: "Account Name"             # Display name
+    api_key_env: "1_BYBIT_API_KEY"   # Env var for API key
+    api_secret_env: "1_BYBIT_API_SECRET"
+    demo_trading: true/false         # Demo vs production
+    dry_run: false                   # Dry run mode (no real orders)
+    
+    risk_management:
+      mm_rate_threshold: 90.0        # Emergency close threshold (%)
+      balance_buffer_percent: 15.0   # Safety buffer (%)
+    
+    strategies:                      # Multiple strategies per account
+      - symbol: "DOGEUSDT"           # REQUIRED - no default!
+        category: "linear"           # USDT perpetual futures
+        leverage: 75                 # Trading leverage
+        initial_position_size_usd: 1.0  # Initial MARGIN in USD
+        grid_step_percent: 1.0       # Grid step (%)
+        averaging_multiplier: 2.0    # Martingale multiplier
+        take_profit_percent: 1.0     # TP percentage
+        max_grid_levels_per_side: 10 # Max averaging levels
+```
+
+## Environment Variables
+
+Store in `.env` file (never commit!):
+```bash
+# Account 1
+1_BYBIT_API_KEY=your_key_here
+1_BYBIT_API_SECRET=your_secret_here
+
+# Account 2
+2_BYBIT_API_KEY=...
+2_BYBIT_API_SECRET=...
+```
+
+## Constants
+
+All hardcoded values go in [config/constants.py](mdc:config/constants.py):
+
+```python
+class TradingConstants:
+    # Timing
+    BALANCE_CACHE_TTL_SEC = 5.0
+    SYNC_INTERVAL_SEC = 60
+    
+    # Fees
+    BYBIT_TAKER_FEE_RATE = 0.00055  # 0.055%
+    BYBIT_MAKER_FEE_RATE = 0.00020  # 0.020%
+    
+    # Limits
+    ORDER_HISTORY_LIMIT = 100
+    
+    # Position indices
+    POSITION_IDX_LONG = 1
+    POSITION_IDX_SHORT = 2
+```
+
+## Loading Configuration
+
+Use [ConfigLoader](mdc:src/utils/config_loader.py):
+```python
+from src.utils.config_loader import ConfigLoader
+
+config = ConfigLoader()
+accounts = config.get_accounts()
+```
+
+## Configuration Validation
+
+- Account ID must be unique
+- At least one strategy per account
+- Symbol is REQUIRED (no default allowed)
+- API key environment variables must exist
+- Leverage must be within Bybit limits
+
+## Multi-Account Configuration
+
+Each account is completely isolated:
+- Separate API keys (different env vars)
+- Independent risk management settings
+- Can trade different symbols
+- Can use different environments (demo/prod)
+- Different leverage and position sizes
+
+## Risk Parameter Tuning
+
+Conservative (low risk):
+```yaml
+leverage: 15
+grid_step_percent: 2.5
+averaging_multiplier: 1.4
+take_profit_percent: 1.5
+max_grid_levels_per_side: 6
+mm_rate_threshold: 60.0
+```
+
+Aggressive (high risk - default):
+```yaml
+leverage: 75
+grid_step_percent: 1.0
+averaging_multiplier: 2.0
+take_profit_percent: 1.0
+max_grid_levels_per_side: 10
+mm_rate_threshold: 90.0
+```

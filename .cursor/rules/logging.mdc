@@ -1,0 +1,108 @@
+---
+description: Logging patterns and conventions
+---
+
+# Logging Conventions
+
+## Per-Account Log Files
+
+Each account writes to separate log files in `logs/`:
+- Bot logs: `logs/{account_id}_bot_{date}.log`
+- Trade logs: `logs/{account_id}_trades_{date}.log`
+- Position logs: `logs/{account_id}_positions_{date}.log`
+
+## Log Format
+
+All logs use Helsinki timezone (Europe/Helsinki):
+```
+2025-10-15 10:30:45 [INFO] [001] Message content here
+```
+
+## Logger Setup
+
+Use injected logger from TradingAccount:
+```python
+def __init__(self, account_logger: Optional[logging.Logger] = None):
+    self.logger = account_logger or logging.getLogger("sol-trader.module")
+```
+
+## Log Levels
+
+- **DEBUG**: Detailed execution flow, API responses, calculations
+- **INFO**: Important events (trades, position changes, balance updates)
+- **WARNING**: Risk warnings, recoverable errors, rate limit warnings
+- **ERROR**: Unrecoverable errors, API failures, critical issues
+
+## Account ID in Logs
+
+ALWAYS include account ID in log messages:
+```python
+self.logger.info(f"[{self.id_str}] Trade executed: {side} {qty} @ {price}")
+```
+
+## Trade Logging
+
+Use the utility function from [src/utils/logger.py](mdc:src/utils/logger.py):
+```python
+from src.utils.logger import log_trade
+
+log_trade(
+    logger=self.logger,
+    account_id=self.account_id,
+    symbol=self.symbol,
+    side="Buy",
+    qty=750.0,
+    price=0.10,
+    realized_pnl=5.25
+)
+```
+
+## Rate-Limited Logging
+
+For high-frequency events, use rate limiting:
+```python
+current_time = time.time()
+if current_time - self.last_warning_time >= TradingConstants.WARNING_LOG_INTERVAL_SEC:
+    self.logger.warning(f"[{self.id_str}] High MM rate: {mm_rate}%")
+    self.last_warning_time = current_time
+```
+
+## Structured Logging
+
+Include relevant context in all log messages:
+- Account ID (always)
+- Symbol (for strategy logs)
+- Side (LONG/SHORT for position-specific logs)
+- Price/Quantity (for trade logs)
+- Reason (for decision logs)
+
+Example:
+```python
+self.logger.info(
+    f"[{self.id_str}] [{self.symbol}] [LONG] Opening position: "
+    f"qty={qty}, price={price}, reason={reason}"
+)
+```
+
+## Log File Rotation
+
+- Daily rotation by date suffix
+- Keep logs indefinitely (manual cleanup)
+- Each account has isolated log files
+
+## Main System Logger
+
+Main orchestrator logs to `logs/main_{date}.log`:
+- System startup/shutdown
+- Account initialization
+- Global errors
+- Multi-account coordination events
+
+## Helsinki Timezone
+
+All timestamps use Europe/Helsinki timezone via [src/utils/timezone.py](mdc:src/utils/timezone.py):
+```python
+from src.utils.timezone import now_helsinki
+
+timestamp = now_helsinki().strftime("%Y-%m-%d %H:%M:%S")
+```

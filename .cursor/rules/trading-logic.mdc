@@ -1,0 +1,79 @@
+---
+description: Trading and finance specific patterns and rules
+---
+
+# Trading Logic and Financial Calculations
+
+## Position Index Convention (Bybit)
+
+- LONG positions: `positionIdx=1` (use `TradingConstants.POSITION_IDX_LONG`)
+- SHORT positions: `positionIdx=2` (use `TradingConstants.POSITION_IDX_SHORT`)
+- ALWAYS specify `positionIdx` in all Bybit API calls (hedge mode)
+
+## Fee-Adjusted Take Profit
+
+Always calculate TP with fees included:
+```python
+# LONG: price × (1 + tp_pct) × (1 + 2 × fee_rate)
+long_tp = avg_price * (1 + tp_pct / 100) * (1 + 2 * TradingConstants.BYBIT_TAKER_FEE_RATE)
+
+# SHORT: price × (1 - tp_pct) × (1 - 2 × fee_rate)
+short_tp = avg_price * (1 - tp_pct / 100) * (1 - 2 * TradingConstants.BYBIT_TAKER_FEE_RATE)
+```
+
+## Limit Orders
+
+- Use [LimitOrderManager](mdc:src/utils/limit_order_manager.py) for all limit orders
+- Smart offset placement: `LIMIT_ORDER_PRICE_OFFSET_PERCENT` (0.03%)
+- Automatic retry logic with timeout: `LIMIT_ORDER_TIMEOUT_SEC` (10s)
+- Fallback to market order after `LIMIT_ORDER_MAX_RETRIES` (3)
+- Always use maker fees for limit orders: `BYBIT_MAKER_FEE_RATE` (0.020%)
+
+## Margin and Leverage
+
+- `initial_position_size_usd` = MARGIN in USD (not position size!)
+- Position size = margin × leverage
+- Example: $1 margin × 75 leverage = $75 position
+- Always use Cross Margin mode (entire balance as collateral)
+
+## Risk Management (7-Phase System)
+
+Reference [EmergencyStopManager](mdc:src/utils/emergency_stop_manager.py):
+
+1. **Early Freeze**: Block averaging when `available_balance < next_margin × 1.5`
+2. **Panic Mode**: Intelligent TP + position balancing when `available < next_margin × 3`
+3. **Emergency Close**: Close all positions when `mm_rate >= mm_rate_threshold` (default 90%)
+
+Always check:
+- Available balance before averaging
+- MM Rate (Maintenance Margin Rate) before any operation
+- Emergency stop flag before executing trades
+
+## Balance Caching
+
+- Use [BalanceManager](mdc:src/utils/balance_manager.py) for thread-safe balance access
+- Cache TTL: `TradingConstants.BALANCE_CACHE_TTL_SEC` (5 seconds)
+- Never fetch balance directly from client in hot paths
+- Cache includes: `totalAvailableBalance` and `mmRate` (Account MM Rate)
+
+## Quantity Matching Tolerance
+
+When comparing quantities (position size vs order qty):
+```python
+tolerance = TradingConstants.QTY_MATCH_TOLERANCE_PERCENT  # 0.1%
+if abs(qty1 - qty2) / qty1 <= tolerance / 100:
+    # Quantities match within tolerance
+```
+
+## Symbol Configuration
+
+- Symbol MUST be specified in config (no hardcoded defaults)
+- Always include category: `"linear"` for USDT perpetual futures
+- Supported symbols: Any Bybit USDT perpetual (e.g., `DOGEUSDT`, `ETHUSDT`, `SOLUSDT`)
+
+## WebSocket Data Flow
+
+- Position updates trigger strategy logic (real-time)
+- Wallet updates invalidate balance cache
+- Order/Execution updates for order lifecycle tracking
+- No artificial delays needed (WebSocket is real-time)

@@ -1,0 +1,95 @@
+---
+globs: tests/*.py,tests/**/*.py
+---
+
+# Testing Patterns for SOL-Trader
+
+## Test Structure
+
+- Use pytest framework
+- Place tests in `tests/` directory mirroring source structure
+- Shared fixtures in [tests/conftest.py](mdc:tests/conftest.py)
+- Current test coverage: 172 comprehensive tests
+
+## Mock Bybit API
+
+Always mock external API calls using fixtures from [tests/conftest.py](mdc:tests/conftest.py):
+
+```python
+def test_something(mock_bybit_client):
+    # mock_bybit_client automatically mocks all API responses
+    strategy = GridStrategy(client=mock_bybit_client, ...)
+```
+
+## Common Fixtures
+
+- `mock_bybit_client`: Mocked BybitClient with reasonable defaults
+- `position_manager`: PositionManager instance with test config
+- `grid_strategy`: GridStrategy instance ready for testing
+- `sample_config`: Test configuration dictionary
+
+## Test Account ID
+
+- Use account ID `999` for tests (convention)
+- Zero-padded: `999` for file operations in tests
+
+## Testing Balance/MM Rate
+
+Mock balance manager responses:
+```python
+mock_balance_manager.get_available_balance.return_value = 1000.0
+mock_balance_manager.get_mm_rate.return_value = 45.0
+```
+
+## Testing WebSocket Updates
+
+For position WebSocket updates:
+```python
+# Simulate position update
+update_data = {
+    "data": [{
+        "symbol": "DOGEUSDT",
+        "side": "Buy",
+        "size": "750.0",
+        "avgPrice": "0.10"
+    }]
+}
+grid_strategy._on_position_update(update_data)
+```
+
+## Testing Emergency Stop
+
+```python
+# Set emergency stop flag
+emergency_stop_manager.set_emergency_stop("Test reason")
+
+# Verify flag file created
+assert Path(f"data/.999_emergency_stop").exists()
+```
+
+## Assertions for Financial Data
+
+When comparing floats (prices, balances):
+```python
+import pytest
+assert pytest.approx(expected, rel=1e-6) == actual
+```
+
+## Test Naming Convention
+
+- Test files: `test_<module_name>.py`
+- Test functions: `test_<feature>_<scenario>`
+- Example: `test_open_position_when_no_position_exists()`
+
+## Running Tests
+
+```bash
+# All tests
+pytest tests/ -v
+
+# Specific file
+pytest tests/test_grid_strategy.py -v
+
+# With coverage
+pytest tests/ -v --cov=src --cov-report=html
+```
