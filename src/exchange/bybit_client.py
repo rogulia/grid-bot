@@ -23,10 +23,11 @@ class BybitClient:
         self.session = HTTP(
             demo=demo,
             api_key=api_key,
-            api_secret=api_secret
+            api_secret=api_secret,
+            timeout=10  # 10 second timeout for all API calls to prevent thread hanging
         )
 
-        self.logger.info(f"Bybit client initialized (demo={demo})")
+        self.logger.info(f"Bybit client initialized (demo={demo}, timeout=10s)")
 
     def set_position_mode(self, symbol: str, mode: int = 3, category: str = "linear") -> Dict:
         """

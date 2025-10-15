@@ -3,6 +3,7 @@
 import time
 import threading
 import logging
+import requests
 from typing import Optional, Dict, Callable, TYPE_CHECKING
 from config.constants import TradingConstants
 
@@ -191,7 +192,17 @@ class LimitOrderManager:
             self._start_timeout_timer(order_id)
             
             return order_id
-            
+
+        except requests.exceptions.ReadTimeout as e:
+            self.logger.error(
+                f"[{self.symbol}] ⏱️ TIMEOUT placing limit order (exceeded 10s): {e}"
+            )
+            return None
+        except requests.exceptions.ConnectionError as e:
+            self.logger.error(
+                f"[{self.symbol}] 🔌 CONNECTION ERROR placing limit order: {e}"
+            )
+            return None
         except Exception as e:
             self.logger.error(
                 f"[{self.symbol}] Exception placing limit order: {e}",
