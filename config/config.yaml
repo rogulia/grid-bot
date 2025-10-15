@@ -34,51 +34,51 @@
 
 accounts:
   # Account 1 (ID: 1)
-  # - id: 1
-  #   name: "Iurii Demo"
-  #   api_key_env: "1_BYBIT_API_KEY"       # Env var: 1_BYBIT_API_KEY
-  #   api_secret_env: "1_BYBIT_API_SECRET"
-  #   demo_trading: true                   # Demo environment (virtual money)
-  #   dry_run: false                       # Real API calls (to demo server)
+  - id: 1
+    name: "Iurii Demo"
+    api_key_env: "1_BYBIT_API_KEY"       # Env var: 1_BYBIT_API_KEY
+    api_secret_env: "1_BYBIT_API_SECRET"
+    demo_trading: true                   # Demo environment (virtual money)
+    dry_run: false                       # Real API calls (to demo server)
 
-  #   # Per-account risk management
-  #   risk_management:
-  #     mm_rate_threshold: 90.0            # Emergency close when Account MM Rate >= this % (default: 90)
-  #     balance_buffer_percent: 15.0       # Safety buffer for reserve checks - % (default: 15)
+    # Per-account risk management
+    risk_management:
+      mm_rate_threshold: 90.0            # Emergency close when Account MM Rate >= this % (default: 90)
+      balance_buffer_percent: 15.0       # Safety buffer for reserve checks - % (default: 15)
 
-  #   # Strategies for this account
-  #   strategies:
-  #     - symbol: "DOGEUSDT"
-  #       category: "linear"
-  #       leverage: 75
-  #       initial_position_size_usd: 1.0   # MARGIN in USD (leverage applied automatically!)
-  #       grid_step_percent: 1.0           # Grid step %
-  #       averaging_multiplier: 2.0        # Position multiplier
-  #       take_profit_percent: 1.0         # Take profit %
-  #       max_grid_levels_per_side: 10
+    # Strategies for this account
+    strategies:
+      - symbol: "DOGEUSDT"
+        category: "linear"
+        leverage: 75
+        initial_position_size_usd: 1.0   # MARGIN in USD (leverage applied automatically!)
+        grid_step_percent: 1.0           # Grid step %
+        averaging_multiplier: 2.0        # Position multiplier
+        take_profit_percent: 1.0         # Take profit %
+        max_grid_levels_per_side: 10
 
   # Account 2 (ID: 2)
-  # - id: 2
-  #   name: "Andrii Demo"
-  #   api_key_env: "2_BYBIT_API_KEY"
-  #   api_secret_env: "2_BYBIT_API_SECRET"
-  #   demo_trading: true
-  #   dry_run: false
+  - id: 2
+    name: "Andrii Demo"
+    api_key_env: "2_BYBIT_API_KEY"
+    api_secret_env: "2_BYBIT_API_SECRET"
+    demo_trading: true
+    dry_run: false
 
-  #   # Per-account risk management
-  #   risk_management:
-  #     mm_rate_threshold: 90.0            # Emergency close when Account MM Rate >= this % (default: 90)
-  #     balance_buffer_percent: 15.0       # Safety buffer for reserve checks - % (default: 15)
+    # Per-account risk management
+    risk_management:
+      mm_rate_threshold: 90.0            # Emergency close when Account MM Rate >= this % (default: 90)
+      balance_buffer_percent: 15.0       # Safety buffer for reserve checks - % (default: 15)
 
-  #   strategies:
-  #     - symbol: "ETHUSDT"
-  #       category: "linear"
-  #       leverage: 100
-  #       initial_position_size_usd: 10.0
-  #       grid_step_percent: 1.0
-  #       averaging_multiplier: 2.0
-  #       take_profit_percent: 1.0
-  #       max_grid_levels_per_side: 10
+    strategies:
+      - symbol: "ETHUSDT"
+        category: "linear"
+        leverage: 100
+        initial_position_size_usd: 10.0
+        grid_step_percent: 1.0
+        averaging_multiplier: 2.0
+        take_profit_percent: 1.0
+        max_grid_levels_per_side: 10
 
   # Account 3 (ID: 3)
   - id: 3
@@ -112,28 +112,28 @@ accounts:
         max_grid_levels_per_side: 10
 
   # Account 4 (ID: 4)
-  # - id: 4
-  #   name: "Iurii Production"
-  #   api_key_env: "4_BYBIT_API_KEY"
-  #   api_secret_env: "4_BYBIT_API_SECRET"
-  #   demo_trading: false
-  #   dry_run: false
+  - id: 4
+    name: "Iurii Production"
+    api_key_env: "4_BYBIT_API_KEY"
+    api_secret_env: "4_BYBIT_API_SECRET"
+    demo_trading: false
+    dry_run: false
 
-  #   # Per-account risk management
-  #   risk_management:
-  #     mm_rate_threshold: 90.0            # Emergency close when Account MM Rate >= this % (default: 90)
-  #     balance_buffer_percent: 15.0       # Safety buffer for reserve checks - % (default: 15)
+    # Per-account risk management
+    risk_management:
+      mm_rate_threshold: 90.0            # Emergency close when Account MM Rate >= this % (default: 90)
+      balance_buffer_percent: 15.0       # Safety buffer for reserve checks - % (default: 15)
 
-  #   # Strategies for this account
-  #   strategies:
-  #     - symbol: "DOGEUSDT"
-  #       category: "linear"
-  #       leverage: 75
-  #       initial_position_size_usd: 1.0   # MARGIN in USD (leverage applied automatically!)
-  #       grid_step_percent: 1.0           # Grid step %
-  #       averaging_multiplier: 2.0        # Position multiplier
-  #       take_profit_percent: 1.0         # Take profit %
-  #       max_grid_levels_per_side: 10
+    # Strategies for this account
+    strategies:
+      - symbol: "DOGEUSDT"
+        category: "linear"
+        leverage: 75
+        initial_position_size_usd: 1.0   # MARGIN in USD (leverage applied automatically!)
+        grid_step_percent: 1.0           # Grid step %
+        averaging_multiplier: 2.0        # Position multiplier
+        take_profit_percent: 1.0         # Take profit %
+        max_grid_levels_per_side: 10
 
 
 # Global bot settings
