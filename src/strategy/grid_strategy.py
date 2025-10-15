@@ -11,6 +11,7 @@ from ..utils.logger import log_trade
 from ..utils.balance_manager import BalanceManager
 from ..utils.timestamp_converter import TimestampConverter
 from ..utils.emergency_stop_manager import EmergencyStopManager
+from ..utils.limit_order_manager import LimitOrderManager
 from config.constants import TradingConstants, LogMessages
 
 if TYPE_CHECKING:
@@ -77,6 +78,15 @@ class GridStrategy:
         if 'symbol' not in config:
             raise ValueError("Trading symbol must be specified in config - cannot use hardcoded default")
         self.symbol = config['symbol']
+
+        # Initialize Limit Order Manager for handling limit orders with retries
+        self.limit_order_manager = LimitOrderManager(
+            client=client,
+            symbol=self.symbol,
+            category=config.get('category', 'linear'),
+            logger=self.logger,
+            dry_run=dry_run
+        )
 
         self.category = config.get('category', 'linear')
         self.leverage = config.get('leverage', 100)
@@ -308,18 +318,31 @@ class GridStrategy:
             order_id = None
             if not self.dry_run:
                 try:
-                    response = self.client.place_order(
-                        symbol=self.symbol,
+                    # Use limit order with retry mechanism
+                    order_id = self.limit_order_manager.place_limit_order(
                         side=side,
                         qty=level_qty,
-                        order_type="Market",
-                        category=self.category
+                        current_price=current_price,
+                        reason=f"Initial position level {grid_level}"
                     )
-                    self.logger.debug(f"[{self.symbol}] Level {grid_level} order response: {response}")
 
-                    # Extract orderId from response
-                    if response and 'result' in response:
-                        order_id = response['result'].get('orderId')
+                    if not order_id:
+                        # Limit order failed, fallback to market immediately
+                        self.logger.warning(
+                            f"[{self.symbol}] Limit order failed for level {grid_level}, using market order"
+                        )
+                        response = self.client.place_order(
+                            symbol=self.symbol,
+                            side=side,
+                            qty=level_qty,
+                            order_type="Market",
+                            category=self.category
+                        )
+                        self.logger.debug(f"[{self.symbol}] Level {grid_level} market order response: {response}")
+
+                        # Extract orderId from response
+                        if response and 'result' in response:
+                            order_id = response['result'].get('orderId')
 
                     # Small delay between orders to preserve order in history
                     time.sleep(0.1)
@@ -931,19 +954,32 @@ class GridStrategy:
                 order_id = None
                 if not self.dry_run:
                     try:
-                        response = self.client.place_order(
-                            symbol=self.symbol,
+                        # Use limit order with retry mechanism
+                        order_id = self.limit_order_manager.place_limit_order(
                             side=side,
                             qty=initial_qty,
-                            order_type="Market",
-                            category=self.category
+                            current_price=current_price,
+                            reason="Initial position (sync)"
                         )
 
-                        self.logger.info(f"[{self.symbol}] Order response: {response}")
+                        if not order_id:
+                            # Limit order failed, fallback to market immediately
+                            self.logger.warning(
+                                f"[{self.symbol}] Limit order failed for initial {side}, using market order"
+                            )
+                            response = self.client.place_order(
+                                symbol=self.symbol,
+                                side=side,
+                                qty=initial_qty,
+                                order_type="Market",
+                                category=self.category
+                            )
 
-                        # Extract orderId from response
-                        if response and 'result' in response:
-                            order_id = response['result'].get('orderId')
+                            self.logger.info(f"[{self.symbol}] Market order response: {response}")
+
+                            # Extract orderId from response
+                            if response and 'result' in response:
+                                order_id = response['result'].get('orderId')
 
                         # Track position locally
                         self.pm.add_position(
@@ -1112,10 +1148,24 @@ class GridStrategy:
             is_close = closed_size > 0 or closed_pnl != 0
 
             if not is_close:
-                # Position open/add - just log
+                # Position open/add - log
                 self.logger.debug(
                     f"📝 [{symbol}] {side} OPEN: qty={exec_qty} price={exec_price}"
                 )
+                
+                # Detect limit orders and notify LimitOrderManager
+                order_id = exec_data.get('orderId', '')
+                if order_type == 'Limit' and order_id:
+                    # Limit order executed - notify LimitOrderManager
+                    synthetic_order_data = {
+                        'orderId': order_id,
+                        'orderStatus': 'Filled',
+                        'orderType': 'Limit',
+                        'side': side,
+                        'execQty': exec_qty
+                    }
+                    self.limit_order_manager.on_order_update(synthetic_order_data)
+                
                 return
 
             # POSITION CLOSE - process with real data from exchange
@@ -1450,6 +1500,21 @@ class GridStrategy:
         # Update price history for ATR calculation (Phase 1: Advanced Risk Management)
         self._update_price_history(current_price)
 
+        # Update current price for all tracked limit orders (for retry logic)
+        # This ensures retries use fresh market price
+        if hasattr(self, 'limit_order_manager'):
+            with self.limit_order_manager._lock:
+                for order_id in list(self.limit_order_manager._tracked_orders.keys()):
+                    self.limit_order_manager.update_current_price(order_id, current_price)
+            
+            # Periodically cleanup old orders (once per minute)
+            if not hasattr(self, '_last_cleanup_time'):
+                self._last_cleanup_time = 0
+            
+            if time.time() - self._last_cleanup_time > 60:
+                self.limit_order_manager.cleanup_old_orders(max_age_seconds=120)
+                self._last_cleanup_time = time.time()
+
         # Block all operations if emergency stop was triggered
         if self.emergency_stopped:
             return
@@ -1614,18 +1679,31 @@ class GridStrategy:
             # Execute order (or simulate)
             order_id = None
             if not self.dry_run:
-                response = self.client.place_order(
-                    symbol=self.symbol,
+                # Use limit order with retry mechanism
+                order_id = self.limit_order_manager.place_limit_order(
                     side=side,
                     qty=new_size,
-                    order_type="Market",
-                    category=self.category
+                    current_price=current_price,
+                    reason=f"Grid level {grid_level}"
                 )
-                self.logger.info(f"[{self.symbol}] Order response: {response}")
 
-                # Extract orderId from response
-                if response and 'result' in response:
-                    order_id = response['result'].get('orderId')
+                if not order_id:
+                    # Limit order failed, fallback to market immediately
+                    self.logger.warning(
+                        f"[{self.symbol}] Limit order failed for grid level {grid_level}, using market order"
+                    )
+                    response = self.client.place_order(
+                        symbol=self.symbol,
+                        side=side,
+                        qty=new_size,
+                        order_type="Market",
+                        category=self.category
+                    )
+                    self.logger.info(f"[{self.symbol}] Market order response: {response}")
+
+                    # Extract orderId from response
+                    if response and 'result' in response:
+                        order_id = response['result'].get('orderId')
 
             # Add to position manager
             self.pm.add_position(
@@ -1877,6 +1955,7 @@ class GridStrategy:
 
                 if local_qty == 0:
                     # Position exists on exchange but not tracked locally
+<<<<<<< HEAD
                     # This should NEVER happen - positions should ONLY be restored via REST API in sync_with_exchange()
                     # WebSocket should only update existing positions, not create new ones
                     self.logger.error(
@@ -1889,6 +1968,32 @@ class GridStrategy:
                         f"Position exists on exchange but not tracked locally for {side}: "
                         f"exchange={size_float}, local=0. Position restoration should happen ONLY via REST API "
                         f"in sync_with_exchange(), not from WebSocket. Restart bot to trigger proper sync."
+=======
+                    # This happens on bot restart - restore from Position WebSocket snapshot
+                    
+                    # CRITICAL: Skip restoration if avgPrice is missing
+                    # REST API sync will restore it properly with correct price
+                    if not avg_price or avg_price == '0' or float(avg_price) == 0.0:
+                        self.logger.warning(
+                            f"⚠️  [{self.symbol}] Skipping {side} position restoration from WebSocket: "
+                            f"avgPrice is missing (size={size_float}). Will restore via REST sync."
+                        )
+                        return
+                    
+                    self.logger.info(
+                        f"📥 [{self.symbol}] Restoring {side} position from Position WebSocket: "
+                        f"{size_float} @ ${avg_price}"
+                    )
+
+                    # Restore position as single entry (grid_level=0)
+                    # Note: We lose grid level details, but exchange avgPrice is accurate
+                    self.pm.add_position(
+                        side=side,
+                        entry_price=float(avg_price),
+                        quantity=size_float,
+                        grid_level=0,  # Restored position (no grid history)
+                        order_id=None  # Position WebSocket doesn't provide orderId
+>>>>>>> 142be08fc627964a6c3d3c340b17b94060ec5aed
                     )
                     
                     # Create emergency stop flag
@@ -1974,7 +2079,8 @@ class GridStrategy:
         """
         Handle order update from WebSocket
 
-        Called when order stream sends an update. Tracks TP order IDs automatically.
+        Called when order stream sends an update. Tracks TP order IDs automatically
+        and manages limit order retries.
 
         Args:
             order_data: Order data from Bybit WebSocket
@@ -1993,6 +2099,10 @@ class GridStrategy:
                 f"status={order_status}, type={order_type}, side={side}, "
                 f"positionIdx={position_idx}, reduceOnly={reduce_only}"
             )
+
+            # Pass to LimitOrderManager for limit order tracking
+            # Manager handles timeout/retry logic for its tracked orders
+            self.limit_order_manager.on_order_update(order_data)
 
             # Only track Take Profit orders (Limit orders with reduceOnly=True)
             # TP orders are created as Limit orders, NOT Market orders!
