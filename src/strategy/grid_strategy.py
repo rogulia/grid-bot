@@ -1955,7 +1955,6 @@ class GridStrategy:
 
                 if local_qty == 0:
                     # Position exists on exchange but not tracked locally
-<<<<<<< HEAD
                     # This should NEVER happen - positions should ONLY be restored via REST API in sync_with_exchange()
                     # WebSocket should only update existing positions, not create new ones
                     self.logger.error(
@@ -1968,32 +1967,6 @@ class GridStrategy:
                         f"Position exists on exchange but not tracked locally for {side}: "
                         f"exchange={size_float}, local=0. Position restoration should happen ONLY via REST API "
                         f"in sync_with_exchange(), not from WebSocket. Restart bot to trigger proper sync."
-=======
-                    # This happens on bot restart - restore from Position WebSocket snapshot
-                    
-                    # CRITICAL: Skip restoration if avgPrice is missing
-                    # REST API sync will restore it properly with correct price
-                    if not avg_price or avg_price == '0' or float(avg_price) == 0.0:
-                        self.logger.warning(
-                            f"⚠️  [{self.symbol}] Skipping {side} position restoration from WebSocket: "
-                            f"avgPrice is missing (size={size_float}). Will restore via REST sync."
-                        )
-                        return
-                    
-                    self.logger.info(
-                        f"📥 [{self.symbol}] Restoring {side} position from Position WebSocket: "
-                        f"{size_float} @ ${avg_price}"
-                    )
-
-                    # Restore position as single entry (grid_level=0)
-                    # Note: We lose grid level details, but exchange avgPrice is accurate
-                    self.pm.add_position(
-                        side=side,
-                        entry_price=float(avg_price),
-                        quantity=size_float,
-                        grid_level=0,  # Restored position (no grid history)
-                        order_id=None  # Position WebSocket doesn't provide orderId
->>>>>>> 142be08fc627964a6c3d3c340b17b94060ec5aed
                     )
                     
                     # Create emergency stop flag
