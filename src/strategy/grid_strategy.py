@@ -124,6 +124,9 @@ class GridStrategy:
         self._is_syncing = False
         self._sync_lock = threading.Lock()
 
+        # Debounce for missed close reopen - prevents duplicate reopen
+        self._just_reopened_until_ts = {'Buy': 0.0, 'Sell': 0.0}
+
         # Track cumulative realized PnL for each side (to calculate delta on position close)
         self._last_cum_realised_pnl = {'Buy': 0.0, 'Sell': 0.0}
 
@@ -1071,6 +1074,77 @@ class GridStrategy:
                             grid_level=0,
                             order_id=None
                         )
+
+                elif exchange_qty == 0 and local_qty > 0:
+                    # UNTRACKED CLOSE: Position closed on exchange but not detected via WebSocket
+                    self.logger.warning(
+                        f"⚠️  [{self.symbol}] Untracked {side} position close detected: "
+                        f"exchange=0, local={local_qty}. WebSocket missed close event."
+                    )
+                    
+                    # Check debounce - prevent duplicate reopen if just did it
+                    with self._sync_lock:
+                        now = time.monotonic()
+                        if now < self._just_reopened_until_ts.get(side, 0.0):
+                            self.logger.debug(
+                                f"[{self.symbol}] Skipping reopen for {side} (debounce until {self._just_reopened_until_ts[side]:.3f})"
+                            )
+                            continue  # Skip to next side
+                    
+                    self.logger.info(
+                        f"🔄 [{self.symbol}] Handling missed {side} close - clearing local state and reopening"
+                    )
+                    
+                    # Clear local positions (simulate what WebSocket close would do)
+                    self.pm.remove_all_positions(side)
+                    self.pm.set_tp_order_id(side, None)
+                    
+                    # Clear TP order from in-memory tracking
+                    with self._tp_orders_lock:
+                        if side in self._tp_orders:
+                            del self._tp_orders[side]
+                    
+                    # Reopen position if not in emergency stop
+                    if not self.emergency_stopped and not self.dry_run:
+                        try:
+                            # Calculate adaptive reopen size
+                            opposite_side = 'Sell' if side == 'Buy' else 'Buy'
+                            reopen_margin = self.calculate_reopen_size(side, opposite_side)
+                            
+                            # Check reserve before reopen (prevent "insufficient balance" error)
+                            if self.trading_account and not self.trading_account.check_reserve_before_averaging(
+                                symbol=self.symbol,
+                                side=side,
+                                next_averaging_margin=reopen_margin
+                            ):
+                                self.logger.warning(
+                                    f"[{self.symbol}] Reserve check failed for missed-close reopen ({side}), need ${reopen_margin:.2f}"
+                                )
+                                continue  # Skip reopen, will retry in next sync cycle
+                            
+                            self.logger.info(
+                                f"🆕 [{self.symbol}] ADAPTIVE REOPEN (missed close): {side} with ${reopen_margin:.2f} margin"
+                            )
+                            
+                            # Reopen with custom margin
+                            self._open_initial_position(
+                                side=side,
+                                current_price=current_price,
+                                custom_margin_usd=reopen_margin
+                            )
+                            
+                            # Set debounce - prevent duplicate reopen for 3 seconds
+                            with self._sync_lock:
+                                self._just_reopened_until_ts[side] = now + 3.0
+                            
+                            self.logger.info(
+                                f"✅ [{self.symbol}] Reopened {side} after untracked close with ${reopen_margin:.2f} margin"
+                            )
+                            
+                        except Exception as e:
+                            self.logger.error(
+                                f"❌ [{self.symbol}] Failed to reopen {side} after untracked close: {e}"
+                            )
 
                 else:
                     # FAIL-FAST: Unexplained mismatch (manual intervention required)
