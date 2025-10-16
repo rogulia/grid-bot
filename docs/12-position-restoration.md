@@ -34,6 +34,13 @@ The bot NEVER uses fallback or estimated values. If data cannot be verified from
 **Tolerance:**
 Strict tolerance of `0.001` (allows only rounding errors). Larger differences trigger fail-fast behavior.
 
+**Recent Improvements (2025-10-16):**
+- **Pagination:** Support for up to 2000 orders (10 pages × 200) instead of 200
+- **Timeout:** 30-second safety limit prevents hanging during restore
+- **Order ID Verification:** Automatically cleans stale order IDs from history
+- **Reference Qty Table:** Ensures perfect qty symmetry for hedging after restart
+- **Improved Logging:** Clear messages for partial TP and grid state resets
+
 ---
 
 ## When Restoration Happens
@@ -275,21 +282,47 @@ if qty_diff <= tolerance:
 
 ## Grid Level Restoration Algorithm
 
-When exchange has a position but local tracking is empty, bot reconstructs grid levels from **order history**.
+When exchange has a position but local tracking is empty, bot reconstructs grid levels from **order history** using **pagination**.
 
 ### Algorithm Steps
 
-**1. Fetch Order History**
+**0. Build Reference Qty Table (NEW - 2025-10-16)**
 ```python
-orders = client.get_order_history(
-    symbol=symbol,
-    category="linear",
-    limit=200,  # TradingConstants.ORDER_HISTORY_LIMIT
-    order_status="Filled"  # Only filled orders!
-)
+# Called BEFORE restoration to ensure perfect qty symmetry
+# Analyzes order history for BOTH sides
+all_orders_buy = self._fetch_all_orders_until_last_tp('Buy')
+all_orders_sell = self._fetch_all_orders_until_last_tp('Sell')
+combined_orders = all_orders_buy + all_orders_sell
+
+self._build_reference_qty_table(combined_orders)
+# Result: _reference_qty_per_level = {0: 364, 1: 728, 2: 1456, ...}
 ```
 
-**Why only "Filled"?** Dramatically increases effective history depth (200 filled vs 200 mixed with cancelled).
+**Why?** Ensures LONG and SHORT have identical qty on each grid level after restart (perfect hedging).
+
+**1. Fetch Order History with Pagination (IMPROVED - 2025-10-16)**
+```python
+# New method with pagination support
+orders = self._fetch_all_orders_until_last_tp(side)
+
+# Internally fetches up to 10 pages (2000 orders):
+while page_count < MAX_PAGINATION_PAGES:  # 10
+    result = client.get_order_history(
+        symbol=symbol,
+        category="linear",
+        limit=200,
+        order_status="Filled",
+        cursor=cursor  # NEW: pagination cursor
+    )
+    orders.extend(result['list'])
+    cursor = result['nextPageCursor']
+
+    # Stop if last TP found
+    if tp_found:
+        break
+```
+
+**Why only "Filled"?** Dramatically increases effective history depth (2000 filled vs 2000 mixed with cancelled).
 
 **2. Filter Orders by positionIdx**
 ```python
@@ -346,7 +379,25 @@ for i, order in enumerate(current_position_orders):
         positions.append((qty, price, grid_level, order_id))
 ```
 
-**7. Validate Restored Quantity**
+**7. Verify and Cleanup Order IDs (NEW - 2025-10-16)**
+```python
+# Verify that order IDs from history still exist on exchange
+positions = self._verify_and_cleanup_order_ids(positions)
+
+# Internally checks:
+for qty, price, grid_level, order_id in positions:
+    if order_id:
+        open_orders = client.get_open_orders(symbol, category)
+        order_exists = any(o.get('orderId') == order_id for o in open_orders)
+
+        if not order_exists:
+            # Clear stale ID
+            order_id = None
+```
+
+**Why?** Order IDs from history may be cancelled/expired. Cleared IDs prevent tracking issues.
+
+**8. Validate Restored Quantity**
 ```python
 restored_qty = sum(qty for qty, _, _, _ in positions)
 qty_diff = restored_qty - total_qty  # signed difference
@@ -447,19 +498,27 @@ self._resync_triggers.append({
 
 ---
 
-### 3. Truncated Order History
+### 3. Truncated Order History (IMPROVED - 2025-10-16)
 
-**Problem:** Position has more grid levels than history depth (> 200 orders between last TP and now)
+**Problem:** Position has more grid levels than history depth (> 2000 orders between last TP and now)
 
-**Detection:** `len(orders) == ORDER_HISTORY_LIMIT` (200)
+**Detection:** Fetched max pages (10) without finding last TP
 
-**Solution:** Warning logged, but restore continues. If validation fails → retry
+**Solution:** Safety limit reached → grid state reset (see Case 7)
+
+**Old Limit:** 200 orders (single page)
+**New Limit:** 2000 orders (10 pages with pagination)
 
 **Log Example:**
 ```
-2025-10-15 23:49:39 - WARNING - ⚠️ [DOGEUSDT] Retrieved exactly 200 orders -
-    history may be truncated. If restoration fails, consider closing positions manually.
+[DOGEUSDT] Fetching order history with pagination (max 10 pages)...
+[DOGEUSDT] Page 10: fetched 200 orders
+[DOGEUSDT] Fetched total 2000 filled orders across 10 page(s)
+⚠️  [DOGEUSDT] Last TP not found after 2000 orders - may be beyond pagination limit
+🔄 [DOGEUSDT] GRID STATE RESET: Creating fresh grid from exchange data
 ```
+
+**Why 10 pages?** Balance between thoroughness and API rate limits. 2000 orders covers ~99% of real-world cases.
 
 ---
 
@@ -516,19 +575,93 @@ self._resync_triggers.append({
 
 ---
 
-### 7. No Position Orders After Last TP
+### 7. No Position Orders After Last TP - Grid State Reset (IMPROVED - 2025-10-16)
 
 **Problem:** Found TP close, but no opening orders after it
 
-**Cause:** Position opened VERY recently (orders not yet in history)
+**Cause:**
+1. **Partial TP close** - remaining position from orders BEFORE TP
+2. Order history beyond pagination limit
+3. Position opened VERY recently (orders not yet in history)
 
-**Solution:** FAIL-FAST with manual intervention instruction
+**Old Behavior:** FAIL-FAST with manual intervention
+**New Behavior:** **Grid State Reset** - safe and automatic
+
+**Solution:** Create single position at level 0 from exchange avgPrice, new grid starts here
 
 **Log Example:**
 ```
-2025-10-15 23:49:40 - ERROR - ❌ [DOGEUSDT] No Buy position orders found after last TP - cannot restore.
-    Manual intervention required: close position on exchange and restart bot.
+⚠️  [DOGEUSDT] No Buy opening orders after last TP -
+    likely PARTIAL TP CLOSE or history truncated.
+    Grid levels CANNOT be reconstructed.
+🔄 RESETTING grid state to level 0 (this is safe and expected).
+
+🔄 [DOGEUSDT] GRID STATE RESET for Buy: Order history incomplete.
+   Creating fresh grid from exchange data.
+📊 [DOGEUSDT] Exchange position: qty=400, avgPrice=$0.1825
+
+✅ [DOGEUSDT] Grid reset complete: Buy position = 400 @ $0.1825 (level 0).
+   Previous grid levels lost (expected after partial TP). New grid starts here.
 ```
+
+**Why is this safe?**
+- TP orders work correctly with avgPrice from exchange
+- Multiplier applies to new positions correctly
+- Previous grid levels no longer relevant after partial close
+
+---
+
+### 8. Timeout During Restore (NEW - 2025-10-16)
+
+**Problem:** Restore process takes longer than 30 seconds
+
+**Detection:** `elapsed_time > RESTORATION_TIMEOUT_SEC` (30 seconds)
+
+**Cause:**
+1. Very slow exchange API responses
+2. Continuous WebSocket interruptions (many retries)
+3. Network connectivity issues
+
+**Solution:** Emergency stop with timeout diagnostics
+
+**Log Example:**
+```
+❌ [DOGEUSDT] Restoration timeout after 31.2 seconds (limit: 30s)
+   Retry count: 2/3
+
+💥 CRITICAL: Failed to restore state after timeout due to continuous position changes.
+
+🔍 DIAGNOSTIC INFO:
+- Retry count: 2
+- Elapsed time: 31.2s (limit: 30s)
+- Timed out: True
+- WebSocket interruptions: 15
+```
+
+**Why 30 seconds?** Balance between patience for slow APIs and preventing indefinite hangs.
+
+---
+
+### 9. Stale Order IDs After Restart (NEW - 2025-10-16)
+
+**Problem:** Order IDs from history may no longer exist on exchange
+
+**Detection:** `_verify_and_cleanup_order_ids()` checks via `get_open_orders()`
+
+**Cause:**
+1. Orders cancelled manually during downtime
+2. Orders expired (time-in-force)
+3. Orders filled/closed before restart
+
+**Solution:** Automatically clear invalid order IDs
+
+**Log Example:**
+```
+[DOGEUSDT] Order ID abc123 for level 2 no longer exists - clearing
+[DOGEUSDT] Cleaned 2 stale order IDs from restored positions
+```
+
+**Why verify?** Prevents tracking errors and ensures clean state after restart.
 
 ---
 
@@ -538,13 +671,21 @@ self._resync_triggers.append({
 
 Bot makes **up to 3 attempts** to restore state. If all fail → Emergency stop with full diagnostics.
 
-### Retry Loop Logic
+### Retry Loop Logic (IMPROVED - 2025-10-16)
 
 ```python
 max_retries = 3
+max_total_time = TradingConstants.RESTORATION_TIMEOUT_SEC  # 30 seconds (NEW)
 retry_count = 0
+retry_start_time = time.time()  # NEW: Track total elapsed time
 
 while retry_count < max_retries:
+    # NEW: Check timeout
+    elapsed = time.time() - retry_start_time
+    if elapsed > max_total_time:
+        self.logger.error(f"Restoration timeout after {elapsed:.1f}s")
+        break  # Exit to error handling
+
     # Reset resync flag
     with self._resync_lock:
         self._needs_resync = False
@@ -567,9 +708,12 @@ while retry_count < max_retries:
 
     retry_count += 1
 
-# If exited due to max retries → emergency stop
-if retry_count >= max_retries:
-    # Create emergency stop with diagnostics
+# NEW: Handle both max retries AND timeout
+elapsed_total = time.time() - retry_start_time
+timed_out = elapsed_total > max_total_time
+
+if retry_count >= max_retries or timed_out:
+    # Create emergency stop with diagnostics (including timeout info)
     ...
 ```
 
@@ -592,10 +736,12 @@ After 3 failed attempts, bot creates detailed emergency stop:
 
 **Log Example:**
 ```
-2025-10-15 23:49:45 - ERROR - ❌ [DOGEUSDT] Failed to restore state after 3 attempts due to continuous position changes.
+2025-10-15 23:49:45 - ERROR - ❌ [DOGEUSDT] Failed to restore state after 3 attempts or 30s timeout due to continuous position changes.
 
 🔍 DIAGNOSTIC INFO:
 - Retry count: 3
+- Total elapsed time: 31.2s (timeout: 30s)
+- Timed out: Yes
 - WebSocket interruptions: 7
 - Interruption events: execution_update, position_update, execution_update, validation_failed, ...
 - Exchange state: LONG=22932@$0.1994, SHORT=1149@$0.1971
@@ -606,6 +752,7 @@ After 3 failed attempts, bot creates detailed emergency stop:
 2. Another bot/system using same account
 3. Very active market with frequent TP triggers
 4. Exchange API returning inconsistent data
+5. Restoration process taking longer than 30s timeout
 
 🔧 RESOLUTION:
 1. Stop all manual trading and other bots
@@ -1148,7 +1295,7 @@ if not tp_id:
 
 **Causes:**
 - Position opened during order history fetch (race condition)
-- Order history truncated (> 200 orders between last TP and now)
+- Order history truncated (> 2000 orders between last TP and now)
 
 **Resolution:**
 - Bot automatically retries (up to 3 attempts)
@@ -1218,8 +1365,8 @@ grep -i "ERROR\|CRITICAL" logs/001_bot_$(date +%Y-%m-%d).log | tail -50
 ### 3. Order History Awareness
 
 **Do:**
-- Understand bot can restore from ~200 filled orders
-- If position has > 200 grid levels → close and restart
+- Understand bot can restore from up to 2000 filled orders (via pagination)
+- If position has > 2000 grid levels → close and restart manually
 - Monitor "Retrieved exactly 200 orders" warnings
 
 **Don't:**
@@ -1291,12 +1438,14 @@ Position restoration is a **critical safety mechanism** that ensures data integr
 
 1. **REST API = Source of Truth** at startup
 2. **Four Scenarios** handled with fail-fast approach
-3. **Grid Level Restoration** from order history (200 orders)
-4. **Retry Mechanism** handles WebSocket interruptions (3 attempts)
+3. **Grid Level Restoration** from order history (up to 2000 orders via pagination)
+4. **Retry Mechanism** handles WebSocket interruptions (3 attempts, 30s timeout)
 5. **Force Cancel Mode** ensures clean TP order state
 6. **Emergency Stops** prevent dangerous trading with bad data
 7. **Periodic Sync** catches untracked closes during runtime
 8. **Fail-Fast Philosophy** prioritizes safety over availability
+9. **Reference Qty Table** ensures perfect hedging symmetry
+10. **Order ID Verification** detects and cleans stale order IDs
 
 **Golden Rule:** If bot can't verify data from exchange → STOP. Better safe than sorry!
 
@@ -1351,6 +1500,15 @@ if not self._first_sync_done:
 
 ---
 
-**Document Version:** 1.1
+**Document Version:** 2.0
 **Last Updated:** 2025-10-16
 **Author:** SOL-Trader Development Team
+
+**Version 2.0 Changes:**
+- Added cursor-based pagination support (up to 2000 orders)
+- Added 30-second timeout mechanism for restoration
+- Added reference quantity table for perfect hedging symmetry
+- Added order ID verification and cleanup for stale IDs
+- Improved partial TP handling with clear grid state reset explanation
+- Updated all order history limits from 200 to 2000 throughout document
+- Enhanced diagnostic output with timeout information
