@@ -168,6 +168,31 @@ class GridStrategy(
         # Failed reopening tracking (for recovery in sync_with_exchange)
         self._failed_reopen_sides = set()  # Track sides that failed to reopen after TP
 
+        # First sync flag - used to cancel all orders on bot restart
+        self._first_sync_done = False
+
+        # Pending entry orders tracking (for position symmetry)
+        # Maps grid_level → order_id for each side
+        self._pending_entry_orders = {
+            'Buy': {},   # {grid_level: order_id}
+            'Sell': {}
+        }
+        self._pending_entry_lock = threading.Lock()
+
+        # Base price for pending calculation (updated when pending are placed)
+        # Used to detect when price has moved enough to recalculate pending
+        self._base_price_for_pending = {
+            'Buy': None,
+            'Sell': None
+        }
+
+        # Reference qty per grid level (for perfect qty symmetry)
+        # When first side opens level N, we save qty as reference
+        # Second side (or pending) ALWAYS uses the same qty
+        # This ensures perfect hedging: same qty on both sides regardless of price difference
+        self._reference_qty_per_level = {}  # {grid_level: qty}
+        self._reference_qty_lock = threading.Lock()
+
         self.logger.info(
             f"[{self.symbol}] Grid strategy initialized - Symbol: {self.symbol}, "
             f"Leverage: {self.leverage}x, Grid: {self.grid_step_pct}%, "

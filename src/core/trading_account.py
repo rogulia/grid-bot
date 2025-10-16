@@ -108,6 +108,10 @@ class TradingAccount:
         # ONE lock per account protects all critical operations
         self._account_lock = threading.Lock()
 
+        # Balance operation lock for multi-symbol atomic operations
+        # Prevents race conditions when multiple symbols check/reserve balance simultaneously
+        self._balance_operation_lock = threading.Lock()
+
         # Early Freeze state (Phase 2: Advanced Risk Management)
         # Preventive mechanism to block averaging before panic mode
         self.averaging_frozen = False
@@ -776,13 +780,15 @@ class TradingAccount:
         Check if there's sufficient funds AFTER averaging to balance positions (CRITICAL!)
 
         CORE LOGIC: Must simulate the averaging and verify that AFTER it we still
-        have enough funds to balance positions BY QUANTITY (long_qty = short_qty).
+        have enough funds to balance positions BY QUANTITY (long_qty = short_qty for each symbol).
 
         This prevents situations where:
         - Before averaging: can balance ✅
         - After averaging: CANNOT balance ❌ (DISASTER!)
 
-        CRITICAL: Uses QUANTITY, not margin! Margin can differ due to different entry prices.
+        CRITICAL: Calculates cost PER SYMBOL (each symbol's imbalance_qty × its price / leverage),
+        simulating the averaging operation on the target symbol. This is correct for multi-symbol
+        accounts where different coins have different prices.
 
         Args:
             symbol: Symbol that wants to average (e.g., 'DOGEUSDT')
@@ -806,84 +812,69 @@ class TradingAccount:
             try:
                 # Get strategy for this symbol to calculate next qty
                 strategy = self.strategies.get(symbol)
-                if not strategy or strategy.current_price <= 0:
+                if not strategy:
+                    self.logger.error(f"[{symbol}] Reserve check FAILED: strategy not found")
+                    return False
+                if strategy.current_price <= 0:
+                    self.logger.error(
+                        f"[{symbol}] Reserve check FAILED: current_price not set "
+                        f"(price={strategy.current_price}). This is a bug!"
+                    )
                     return False
 
                 # Calculate next quantity based on margin
                 next_qty = (next_averaging_margin * strategy.leverage) / strategy.current_price
 
-                # 1. Calculate CURRENT quantities across ALL symbols
-                total_long_qty = 0.0
-                total_short_qty = 0.0
-                total_margin_used = 0.0
-                weighted_price = 0.0
-                total_leverage = 0.0
+                # 1. Calculate cost to balance EACH symbol separately, AFTER simulating averaging
+                total_cost_to_balance_after = 0.0
+                buffer_multiplier = 1 + (self.balance_buffer_percent / 100.0)
 
                 for strat in self.strategies.values():
                     try:
-                        # Calculate LONG quantity
-                        for pos in strat.pm.long_positions:
-                            total_long_qty += pos.quantity
-                            position_value = pos.quantity * strat.current_price
-                            total_margin_used += position_value / strat.leverage
+                        # Calculate LONG and SHORT quantities for THIS symbol
+                        symbol_long_qty = sum(pos.quantity for pos in strat.pm.long_positions)
+                        symbol_short_qty = sum(pos.quantity for pos in strat.pm.short_positions)
 
-                        # Calculate SHORT quantity
-                        for pos in strat.pm.short_positions:
-                            total_short_qty += pos.quantity
-                            position_value = pos.quantity * strat.current_price
-                            total_margin_used += position_value / strat.leverage
-                        
-                        # Use price and leverage from averaging symbol
+                        # SIMULATE: If this is the averaging symbol, add next_qty
                         if strat.symbol == symbol:
-                            weighted_price = strat.current_price
-                            total_leverage = strat.leverage
-                            
+                            if side == 'Buy':
+                                symbol_long_qty += next_qty
+                            else:
+                                symbol_short_qty += next_qty
+
+                        # Calculate imbalance for THIS symbol AFTER averaging
+                        symbol_imbalance_qty = abs(symbol_long_qty - symbol_short_qty)
+
+                        if symbol_imbalance_qty < 0.001:
+                            # This symbol will be balanced, skip
+                            continue
+
+                        # Cost to balance THIS symbol (using its own price and leverage)
+                        if strat.current_price > 0:
+                            position_value_to_balance = symbol_imbalance_qty * strat.current_price
+                            symbol_cost_to_balance = (position_value_to_balance / strat.leverage) * buffer_multiplier
+                            total_cost_to_balance_after += symbol_cost_to_balance
+
                     except Exception as e:
-                        self.logger.debug(f"Error calculating quantities for {strat.symbol}: {e}")
+                        self.logger.debug(f"Error calculating imbalance for {strat.symbol}: {e}")
                         continue
 
-                # 2. SIMULATE averaging: quantities AFTER this averaging
-                long_qty_after = total_long_qty + (next_qty if side == 'Buy' else 0)
-                short_qty_after = total_short_qty + (next_qty if side == 'Sell' else 0)
-                
-                # 3. Imbalance BY QUANTITY after averaging
-                imbalance_qty_after = abs(long_qty_after - short_qty_after)
-                
-                # 4. If will be perfectly balanced - always allow!
-                if imbalance_qty_after < 0.001:
-                    self.logger.info(
-                        f"[{symbol}] ✅ Reserve check PASSED: AFTER {side} averaging, "
-                        f"positions will be PERFECTLY BALANCED (qty={long_qty_after:.1f})"
-                    )
-                    return True
-                
-                # 5. Available funds AFTER averaging
+                # 2. Available funds AFTER averaging
                 # Note: get_available_balance() already has current margin deducted by Bybit
                 # So we only subtract the NEW averaging margin (not total_margin_used again!)
                 available_after = self.balance_manager.get_available_balance() - next_averaging_margin
 
-                # 6. Cost to balance AFTER averaging (by quantity)
-                if weighted_price > 0 and total_leverage > 0:
-                    position_value_to_balance = imbalance_qty_after * weighted_price
-                    # Apply configurable buffer (e.g., 15% = 1.15x multiplier)
-                    buffer_multiplier = 1 + (self.balance_buffer_percent / 100.0)
-                    cost_to_balance_after = (position_value_to_balance / total_leverage) * buffer_multiplier
-                else:
-                    return False
-
-                # 7. THE CRITICAL CHECK: Can we balance AFTER averaging?
-                if available_after >= cost_to_balance_after:
+                # 3. THE CRITICAL CHECK: Can we balance AFTER averaging?
+                if available_after >= total_cost_to_balance_after:
                     self.logger.info(
                         f"[{symbol}] ✅ Reserve check PASSED: AFTER {side} averaging ${next_averaging_margin:.2f}, "
-                        f"available_after=${available_after:.2f} >= cost=${cost_to_balance_after:.2f} "
-                        f"(imbalance_qty_after={imbalance_qty_after:.1f})"
+                        f"available_after=${available_after:.2f} >= cost=${total_cost_to_balance_after:.2f}"
                     )
                     return True
                 else:
                     self.logger.warning(
                         f"[{symbol}] ❌ Reserve check FAILED: AFTER {side} averaging ${next_averaging_margin:.2f}, "
-                        f"available_after=${available_after:.2f} < cost=${cost_to_balance_after:.2f} "
-                        f"(imbalance_qty_after={imbalance_qty_after:.1f}). "
+                        f"available_after=${available_after:.2f} < cost=${total_cost_to_balance_after:.2f}. "
                         f"BLOCKING averaging - would make positions unbalanceable!"
                     )
                     return False
@@ -946,13 +937,14 @@ class TradingAccount:
         Check Panic Mode trigger: Cannot balance positions (Phase 3: Advanced Risk Management)
 
         This is the PRIMARY panic trigger. Activates when available funds are insufficient
-        to balance positions by QUANTITY (make long_qty = short_qty) plus safety buffer.
+        to balance positions by QUANTITY (make long_qty = short_qty for each symbol) plus safety buffer.
 
         CORE LOGIC: In hedge mode, balanced positions BY QUANTITY = perfect hedge.
         When long_qty = short_qty, unrealized PnL = 0 regardless of price movement.
         Must ALWAYS have enough funds to balance the quantity imbalance.
 
-        CRITICAL: Uses QUANTITY, not margin! Margin can differ due to different entry prices.
+        CRITICAL: Calculates cost PER SYMBOL (each symbol's imbalance_qty × its price / leverage),
+        then sums total cost. This is correct for multi-symbol accounts where coins have different prices.
 
         Returns:
             (triggered: bool, reason: str)
@@ -964,60 +956,75 @@ class TradingAccount:
             if total_balance <= 0:
                 return (False, "")
 
-            # Calculate QUANTITY in each direction across ALL symbols
-            total_long_qty = 0.0
-            total_short_qty = 0.0
+            # Calculate cost to balance EACH symbol separately (per-symbol qty × price)
+            total_cost_to_balance = 0.0
             total_margin_used = 0.0
-            weighted_price = 0.0  # For cost calculation
-            total_leverage = 0.0
+            imbalance_details = []  # For logging
 
             for strategy in self.strategies.values():
                 try:
-                    # Calculate LONG quantity
+                    # Calculate LONG and SHORT quantities for THIS symbol only
+                    symbol_long_qty = 0.0
+                    symbol_short_qty = 0.0
+
                     for pos in strategy.pm.long_positions:
-                        total_long_qty += pos.quantity
-                        position_value = pos.quantity * strategy.current_price
+                        symbol_long_qty += pos.quantity
+                        position_value = pos.quantity * pos.entry_price
                         total_margin_used += position_value / strategy.leverage
 
-                    # Calculate SHORT quantity
                     for pos in strategy.pm.short_positions:
-                        total_short_qty += pos.quantity
-                        position_value = pos.quantity * strategy.current_price
+                        symbol_short_qty += pos.quantity
+                        position_value = pos.quantity * pos.entry_price
                         total_margin_used += position_value / strategy.leverage
-                    
-                    # Use current price and leverage for cost calculation
+
+                    # Calculate imbalance for THIS symbol only
+                    symbol_imbalance_qty = abs(symbol_long_qty - symbol_short_qty)
+
+                    if symbol_imbalance_qty < 0.001:
+                        # This symbol is balanced, skip
+                        continue
+
+                    # Cost to balance THIS symbol (using its own price and leverage)
                     if strategy.current_price > 0:
-                        weighted_price = strategy.current_price
-                        total_leverage = strategy.leverage
-                        
+                        position_value_to_balance = symbol_imbalance_qty * strategy.current_price
+                        buffer_multiplier = 1 + (self.balance_buffer_percent / 100.0)
+                        symbol_cost_to_balance = (position_value_to_balance / strategy.leverage) * buffer_multiplier
+
+                        total_cost_to_balance += symbol_cost_to_balance
+
+                        # Store for logging
+                        imbalance_details.append({
+                            'symbol': strategy.symbol,
+                            'imbalance_qty': symbol_imbalance_qty,
+                            'long_qty': symbol_long_qty,
+                            'short_qty': symbol_short_qty,
+                            'cost': symbol_cost_to_balance
+                        })
+
                 except Exception as e:
-                    self.logger.debug(f"Error calculating quantities for {strategy.symbol}: {e}")
+                    self.logger.debug(f"Error calculating imbalance for {strategy.symbol}: {e}")
                     continue
 
-            # Calculate position imbalance BY QUANTITY
-            imbalance_qty = abs(total_long_qty - total_short_qty)
-            
-            # If perfectly balanced, no panic needed
-            if imbalance_qty < 0.001:
+            # If all symbols balanced, no panic needed
+            if total_cost_to_balance < 0.01:
                 return (False, "")  # Perfect balance - no risk!
 
             # Available funds (what we have free to use)
-            available = total_balance - total_margin_used
-
-            # Cost to balance: buy imbalance_qty on lagging side
-            if weighted_price > 0 and total_leverage > 0:
-                position_value_to_balance = imbalance_qty * weighted_price
-                # Apply configurable buffer (e.g., 15% = 1.15x multiplier)
-                buffer_multiplier = 1 + (self.balance_buffer_percent / 100.0)
-                cost_to_balance = (position_value_to_balance / total_leverage) * buffer_multiplier
-            else:
-                return (False, "")  # No positions yet
+            # NOTE: total_balance from get_available_balance() is ALREADY net of margin!
+            # Bybit API returns totalAvailableBalance which already deducts used margin.
+            # DO NOT subtract total_margin_used again (double subtraction bug!)
+            available = total_balance
 
             # PANIC trigger: cannot balance positions
-            if available < cost_to_balance:
+            if available < total_cost_to_balance:
+                # Build detailed reason with per-symbol breakdown
+                details_str = ", ".join([
+                    f"{d['symbol']}:imb={d['imbalance_qty']:.1f}(L:{d['long_qty']:.1f}/S:{d['short_qty']:.1f})=${d['cost']:.2f}"
+                    for d in imbalance_details
+                ])
                 reason = (
-                    f"LOW_IM: available=${available:.2f} < cost_to_balance=${cost_to_balance:.2f} "
-                    f"(imbalance_qty={imbalance_qty:.1f}, long_qty={total_long_qty:.1f}, short_qty={total_short_qty:.1f})"
+                    f"LOW_IM: available=${available:.2f} < cost_to_balance=${total_cost_to_balance:.2f} "
+                    f"[{details_str}]"
                 )
                 return (True, reason)
 
@@ -1026,6 +1033,39 @@ class TradingAccount:
         except Exception as e:
             self.logger.error(f"Error checking LOW_IM panic trigger: {e}")
             return (False, "")
+
+    def check_and_reserve_balance(self, symbol: str, margin_needed: float) -> bool:
+        """
+        Thread-safe balance check for multi-symbol operations
+
+        Prevents race condition when multiple symbols check balance simultaneously.
+        Uses lock to make check + reserve atomic.
+
+        Args:
+            symbol: Symbol requesting balance check
+            margin_needed: Margin required (will be multiplied by buffer)
+
+        Returns:
+            True if balance is sufficient (with buffer), False otherwise
+        """
+        with self._balance_operation_lock:
+            # Get strategy to access balance_manager
+            strategy = self.strategies.get(symbol)
+            if not strategy:
+                self.logger.warning(f"[{symbol}] Strategy not found for balance check")
+                return False
+
+            # Get available balance
+            available = strategy.balance_manager.get_available_balance()
+
+            # Apply buffer
+            buffer_multiplier = 1 + (self.balance_buffer_percent / 100.0)
+            required = margin_needed * buffer_multiplier
+
+            if available >= required:
+                return True
+            else:
+                return False
 
     def balance_all_positions_adaptive(self) -> bool:
         """

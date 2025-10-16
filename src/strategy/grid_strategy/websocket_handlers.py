@@ -209,6 +209,10 @@ class WebSocketHandlersMixin:
             self.pm.remove_all_positions(closed_position_side)
             self.pm.set_tp_order_id(closed_position_side, None)
 
+            # CRITICAL: Cancel all pending entry orders for this side
+            # Position is closed - pending orders are no longer valid
+            self._cancel_all_pending_entries(closed_position_side)
+
             # Reopen initial position if needed
             # Get current price (could be from WebSocket or this execution price)
             current_price = exec_price
@@ -222,26 +226,25 @@ class WebSocketHandlersMixin:
                 reopening_succeeded = False
 
                 for attempt in range(max_retries):
-                    try:
-                        # Calculate adaptive reopen size (Phase 5: Advanced Risk Management)
-                        opposite_side = 'Sell' if closed_position_side == 'Buy' else 'Buy'
-                        reopen_margin = self.calculate_reopen_size(closed_position_side, opposite_side)
+                    # Calculate adaptive reopen size (Phase 5: Advanced Risk Management)
+                    opposite_side = 'Sell' if closed_position_side == 'Buy' else 'Buy'
+                    reopen_margin = self.calculate_reopen_size(closed_position_side, opposite_side)
 
-                        # Log adaptive reopen calculation
-                        self.logger.info(
-                            f"🆕 [{symbol}] ADAPTIVE REOPEN: {closed_position_side} "
-                            f"with ${reopen_margin:.2f} margin after TP "
-                            f"(attempt {attempt+1}/{max_retries})"
-                        )
+                    # Log adaptive reopen calculation
+                    self.logger.info(
+                        f"🆕 [{symbol}] ADAPTIVE REOPEN: {closed_position_side} "
+                        f"with ${reopen_margin:.2f} margin after TP "
+                        f"(attempt {attempt+1}/{max_retries})"
+                    )
 
-                        # Use _open_initial_position() to properly split into grid levels
-                        # This ensures consistent behavior with on_position_update() and correct grid_level tracking
-                        self._open_initial_position(
-                            side=closed_position_side,
-                            current_price=current_price,
-                            custom_margin_usd=reopen_margin
-                        )
+                    # Use _open_initial_position() which now returns True/False
+                    success = self._open_initial_position(
+                        side=closed_position_side,
+                        current_price=current_price,
+                        custom_margin_usd=reopen_margin
+                    )
 
+                    if success:
                         # SUCCESS!
                         reopening_succeeded = True
                         self.logger.info(
@@ -249,27 +252,50 @@ class WebSocketHandlersMixin:
                             f"with ${reopen_margin:.2f} margin on attempt {attempt+1}"
                         )
                         break  # Exit retry loop
-
-                    except Exception as e:
+                    else:
+                        # _open_initial_position() returned False (reserve check failed or exception)
                         is_last_attempt = (attempt == max_retries - 1)
 
                         if is_last_attempt:
-                            # ALL RETRIES FAILED - CRITICAL!
-                            self.logger.error(
-                                f"🚨 [{symbol}] CRITICAL FAILURE: Could not reopen {closed_position_side} "
-                                f"after {max_retries} attempts. Last error: {e}"
+                            # ALL RETRIES FAILED - try fallback with initial_size
+                            self.logger.warning(
+                                f"⚠️ [{symbol}] All retry attempts failed. "
+                                f"Trying FALLBACK with initial size ${self.initial_size_usd:.2f}..."
                             )
                         else:
                             # Calculate exponential backoff delay
                             retry_delay = retry_delay_base * (2 ** attempt)  # 2s, 4s, 8s
 
                             self.logger.warning(
-                                f"⚠️ [{symbol}] Reopening attempt {attempt+1} failed: {e}. "
+                                f"⚠️ [{symbol}] Reopening attempt {attempt+1} failed. "
                                 f"Retrying in {retry_delay}s..."
                             )
                             time.sleep(retry_delay)
 
-                # Check if reopening failed completely
+                # FALLBACK: If all retries failed, try with initial_size_usd
+                if not reopening_succeeded:
+                    self.logger.info(
+                        f"🔄 [{symbol}] FALLBACK REOPEN: Attempting with initial size ${self.initial_size_usd:.2f}"
+                    )
+
+                    fallback_success = self._open_initial_position(
+                        side=closed_position_side,
+                        current_price=current_price,
+                        custom_margin_usd=self.initial_size_usd
+                    )
+
+                    if fallback_success:
+                        reopening_succeeded = True
+                        self.logger.info(
+                            f"✅ [{symbol}] FALLBACK SUCCESS: Reopened {closed_position_side} "
+                            f"with initial size ${self.initial_size_usd:.2f}"
+                        )
+                    else:
+                        self.logger.error(
+                            f"❌ [{symbol}] FALLBACK FAILED: Could not reopen even with initial size"
+                        )
+
+                # Check if reopening failed completely (including fallback)
                 if not reopening_succeeded:
                     # Store failed reopen info for sync_with_exchange to detect
                     self._failed_reopen_sides.add(closed_position_side)
@@ -355,20 +381,72 @@ class WebSocketHandlersMixin:
                     if not self.emergency_stopped and not self.dry_run:
                         current_price = float(avg_price) if avg_price else 0.0
                         if current_price > 0:
-                            try:
-                                # Calculate adaptive reopen size (Phase 5: Advanced Risk Management)
+                            # CRITICAL: Reopening MUST succeed. Retry multiple times.
+                            max_retries = 3
+                            retry_delay_base = 2
+
+                            reopening_succeeded = False
+
+                            for attempt in range(max_retries):
+                                # Calculate adaptive reopen size
                                 opposite_side = 'Sell' if side == 'Buy' else 'Buy'
                                 reopen_margin = self.calculate_reopen_size(side, opposite_side)
 
                                 self.logger.info(
-                                    f"[{self.symbol}] ADAPTIVE REOPEN via WebSocket: {side} with ${reopen_margin:.2f} margin"
+                                    f"[{self.symbol}] ADAPTIVE REOPEN via WebSocket: {side} "
+                                    f"with ${reopen_margin:.2f} margin (attempt {attempt+1}/{max_retries})"
                                 )
 
-                                # Open with custom margin
-                                self._open_initial_position(side, current_price, custom_margin_usd=reopen_margin)
-                            except Exception as e:
+                                # Use _open_initial_position() which now returns True/False
+                                success = self._open_initial_position(
+                                    side=side,
+                                    current_price=current_price,
+                                    custom_margin_usd=reopen_margin
+                                )
+
+                                if success:
+                                    reopening_succeeded = True
+                                    self.logger.info(
+                                        f"✅ [{self.symbol}] Reopened {side} with ${reopen_margin:.2f} "
+                                        f"margin on attempt {attempt+1}"
+                                    )
+                                    break
+                                else:
+                                    is_last_attempt = (attempt == max_retries - 1)
+                                    if not is_last_attempt:
+                                        retry_delay = retry_delay_base * (2 ** attempt)
+                                        self.logger.warning(
+                                            f"⚠️ [{self.symbol}] Reopening attempt {attempt+1} failed. "
+                                            f"Retrying in {retry_delay}s..."
+                                        )
+                                        time.sleep(retry_delay)
+
+                            # FALLBACK: If all retries failed, try with initial_size_usd
+                            if not reopening_succeeded:
+                                self.logger.info(
+                                    f"🔄 [{self.symbol}] FALLBACK: Attempting reopen with "
+                                    f"initial size ${self.initial_size_usd:.2f}"
+                                )
+
+                                fallback_success = self._open_initial_position(
+                                    side=side,
+                                    current_price=current_price,
+                                    custom_margin_usd=self.initial_size_usd
+                                )
+
+                                if fallback_success:
+                                    reopening_succeeded = True
+                                    self.logger.info(
+                                        f"✅ [{self.symbol}] FALLBACK SUCCESS: Reopened {side} "
+                                        f"with initial size ${self.initial_size_usd:.2f}"
+                                    )
+
+                            # If all failed, add to failed reopens
+                            if not reopening_succeeded:
+                                self._failed_reopen_sides.add(side)
                                 self.logger.error(
-                                    f"[{self.symbol}] Failed to reopen {side} position after WebSocket close: {e}"
+                                    f"💥 [{self.symbol}] Position {side} NOT REOPENED after WebSocket close! "
+                                    f"Added to recovery queue. Will attempt recovery in next sync cycle (60s)."
                                 )
 
             else:
@@ -545,6 +623,100 @@ class WebSocketHandlersMixin:
             # Pass to LimitOrderManager for limit order tracking
             # Manager handles timeout/retry logic for its tracked orders
             self.limit_order_manager.on_order_update(order_data)
+
+            # Track pending ENTRY orders (NOT reduceOnly)
+            # These are limit orders placed for position symmetry
+            if not reduce_only and order_type == 'Limit' and order_status in ['Filled', 'PartiallyFilled', 'Cancelled']:
+                # Check if this is one of our tracked pending orders
+                grid_level = None
+                track_side = side  # 'Buy' or 'Sell'
+
+                with self._pending_entry_lock:
+                    for level, oid in self._pending_entry_orders[track_side].items():
+                        if oid == order_id:
+                            grid_level = level
+                            break
+
+                if grid_level is not None:
+                    # This is our pending entry order
+                    if order_status == 'Filled':
+                        # FULLY filled - add to position manager
+                        qty = float(order_data.get('qty', 0))
+                        avg_price = float(order_data.get('avgPrice', 0))
+
+                        # CRITICAL: Orphan position check
+                        # Verify that position for this side still exists
+                        current_positions = (self.pm.long_positions if track_side == 'Buy'
+                                            else self.pm.short_positions)
+
+                        if not current_positions:
+                            self.logger.warning(
+                                f"[{self.symbol}] ⚠️ Pending entry filled AFTER position closed! "
+                                f"{track_side} level {grid_level} filled but position already closed. "
+                                f"Adding orphan position - will be closed by TP or emergency."
+                            )
+
+                        # Add to position manager
+                        self.pm.add_position(
+                            side=track_side,
+                            entry_price=avg_price,
+                            quantity=qty,
+                            grid_level=grid_level,
+                            order_id=order_id
+                        )
+
+                        self.logger.info(
+                            f"[{self.symbol}] ✅ Pending entry FILLED: {track_side} level {grid_level} "
+                            f"@ ${avg_price:.4f} (qty={qty:.4f})"
+                        )
+
+                        # Remove from pending tracking
+                        with self._pending_entry_lock:
+                            del self._pending_entry_orders[track_side][grid_level]
+
+                        # Update TP order with new average entry
+                        self._update_tp_order(track_side)
+
+                    elif order_status == 'PartiallyFilled':
+                        # Partial fill - log but wait for full fill
+                        filled_qty = float(order_data.get('cumExecQty', 0))
+                        total_qty = float(order_data.get('qty', 0))
+                        fill_percent = (filled_qty / total_qty) * 100 if total_qty > 0 else 0
+
+                        self.logger.info(
+                            f"[{self.symbol}] 📊 Pending entry partial fill: {track_side} level {grid_level} "
+                            f"{fill_percent:.1f}% filled ({filled_qty:.4f}/{total_qty:.4f})"
+                        )
+
+                    elif order_status == 'Cancelled':
+                        # Cancelled - AUTO-RETRY (Critical fix #1)
+                        self.logger.warning(
+                            f"[{self.symbol}] ⚠️ Pending entry cancelled by exchange: "
+                            f"{track_side} level {grid_level} (orderId={order_id}). "
+                            f"AUTO-RETRYING..."
+                        )
+
+                        # Remove from tracking
+                        with self._pending_entry_lock:
+                            del self._pending_entry_orders[track_side][grid_level]
+
+                        # Automatically re-place with current price
+                        retry_order_id = self.place_pending_entry_order(
+                            side=track_side,
+                            grid_level=grid_level,
+                            base_price=self.current_price
+                        )
+
+                        if retry_order_id:
+                            self.logger.info(
+                                f"[{self.symbol}] ✅ Pending entry re-placed: {track_side} level {grid_level} "
+                                f"(new orderId={retry_order_id})"
+                            )
+                        else:
+                            self.logger.error(
+                                f"[{self.symbol}] ❌ Failed to re-place pending entry: {track_side} level {grid_level}. "
+                                f"Will retry in next sync."
+                            )
 
             # Only track Take Profit orders (Limit orders with reduceOnly=True)
             # TP orders are created as Limit orders, NOT Market orders!

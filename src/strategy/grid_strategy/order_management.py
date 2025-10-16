@@ -2,6 +2,7 @@
 
 import time
 from datetime import datetime
+from typing import Optional
 from config.constants import TradingConstants, LogMessages
 from ...utils.logger import log_trade
 
@@ -22,11 +23,53 @@ class OrderManagementMixin:
             current_price: Current market price
             custom_margin_usd: Optional custom margin in USD (for adaptive reopen). If not provided, uses initial_size_usd
 
-        Raises:
-            Exception: If order placement fails (in live mode)
+        Returns:
+            True if opened successfully, False if failed (insufficient balance/reserve)
         """
         # Use custom margin if provided, otherwise use default initial size
         target_margin = custom_margin_usd if custom_margin_usd is not None else self.initial_size_usd
+
+        # ⚠️ CRITICAL: Check reserve BEFORE attempting to open position
+        if not self.dry_run and self.trading_account:
+            # Use account-level reserve check (accounts for all symbols + safety reserve)
+            if not self.trading_account.check_reserve_before_averaging(
+                symbol=self.symbol,
+                side=side,
+                next_averaging_margin=target_margin
+            ):
+                # Reserve check failed for target margin
+                self.logger.warning(
+                    f"[{self.symbol}] Reserve check failed for {side} reopen with ${target_margin:.2f} margin"
+                )
+
+                # FALLBACK: Try with initial_size_usd if target was larger
+                if target_margin > self.initial_size_usd:
+                    self.logger.info(
+                        f"[{self.symbol}] Attempting fallback reopen with ${self.initial_size_usd:.2f} (initial size)"
+                    )
+
+                    # Check reserve for fallback size
+                    if not self.trading_account.check_reserve_before_averaging(
+                        symbol=self.symbol,
+                        side=side,
+                        next_averaging_margin=self.initial_size_usd
+                    ):
+                        # Even fallback failed
+                        self.logger.error(
+                            f"[{self.symbol}] ❌ FALLBACK FAILED: Reserve check failed even for initial size "
+                            f"${self.initial_size_usd:.2f}. Cannot reopen {side}."
+                        )
+                        return False  # Signal failure to caller
+
+                    # Fallback passed - use initial size
+                    target_margin = self.initial_size_usd
+                else:
+                    # Target was already initial size - can't fallback further
+                    self.logger.error(
+                        f"[{self.symbol}] ❌ Reserve check failed for {side} reopen with initial size "
+                        f"${self.initial_size_usd:.2f}. Cannot reopen."
+                    )
+                    return False  # Signal failure to caller
 
         # Calculate which grid levels are needed
         levels_to_open = self._calculate_grid_levels_for_margin(target_margin)
@@ -36,98 +79,119 @@ class OrderManagementMixin:
             f"in {len(levels_to_open)} parts (levels {levels_to_open})"
         )
 
-        # Open each grid level separately
-        for grid_level in levels_to_open:
-            level_margin = self.initial_size_usd * (self.multiplier ** grid_level)
-            level_qty = self._usd_to_qty(level_margin, current_price)
+        try:
+            # Open each grid level separately
+            for grid_level in levels_to_open:
+                level_margin = self.initial_size_usd * (self.multiplier ** grid_level)
+                # Use reference qty for perfect symmetry
+                level_qty = self._get_qty_for_level(grid_level, side, current_price)
 
-            self.logger.info(
-                f"  Level {grid_level}: ${level_margin:.2f} margin ({level_qty:.1f} {self.symbol})"
-            )
+                self.logger.info(
+                    f"  Level {grid_level}: ${level_margin:.2f} margin ({level_qty:.1f} {self.symbol})"
+                )
 
-            order_id = None
-            if not self.dry_run:
-                try:
-                    # Determine position_idx for hedge mode
-                    position_idx = TradingConstants.POSITION_IDX_LONG if side == 'Buy' else TradingConstants.POSITION_IDX_SHORT
+                order_id = None
+                if not self.dry_run:
+                    try:
+                        # Determine position_idx for hedge mode
+                        position_idx = TradingConstants.POSITION_IDX_LONG if side == 'Buy' else TradingConstants.POSITION_IDX_SHORT
 
-                    # Use limit order with retry mechanism
-                    order_id = self.limit_order_manager.place_limit_order(
-                        side=side,
-                        qty=level_qty,
-                        current_price=current_price,
-                        reason=f"Initial position level {grid_level}",
-                        position_idx=position_idx
-                    )
-
-                    if not order_id:
-                        # Limit order failed, fallback to market immediately
-                        self.logger.warning(
-                            f"[{self.symbol}] Limit order failed for level {grid_level}, using market order"
-                        )
-                        response = self.client.place_order(
-                            symbol=self.symbol,
+                        # Use limit order with retry mechanism
+                        order_id = self.limit_order_manager.place_limit_order(
                             side=side,
                             qty=level_qty,
-                            order_type="Market",
-                            category=self.category,
+                            current_price=current_price,
+                            reason=f"Initial position level {grid_level}",
                             position_idx=position_idx
                         )
-                        self.logger.debug(f"[{self.symbol}] Level {grid_level} market order response: {response}")
 
-                        # Extract orderId from response
-                        if response and 'result' in response:
-                            order_id = response['result'].get('orderId')
+                        if not order_id:
+                            # Limit order failed, fallback to market immediately
+                            self.logger.warning(
+                                f"[{self.symbol}] Limit order failed for level {grid_level}, using market order"
+                            )
+                            response = self.client.place_order(
+                                symbol=self.symbol,
+                                side=side,
+                                qty=level_qty,
+                                order_type="Market",
+                                category=self.category,
+                                position_idx=position_idx
+                            )
+                            self.logger.debug(f"[{self.symbol}] Level {grid_level} market order response: {response}")
 
-                    # Small delay between orders to preserve order in history
-                    time.sleep(0.1)
+                            # Extract orderId from response
+                            if response and 'result' in response:
+                                order_id = response['result'].get('orderId')
 
-                except Exception as e:
-                    self.logger.error(
-                        f"[{self.symbol}] Failed to open {side} position level {grid_level}: {e}"
-                    )
-                    raise
+                        # Small delay between orders to preserve order in history
+                        time.sleep(0.1)
 
-            # Track position
-            self.pm.add_position(
-                side=side,
-                entry_price=current_price,
-                quantity=level_qty,
-                grid_level=grid_level,
-                order_id=order_id
+                    except Exception as e:
+                        self.logger.error(
+                            f"[{self.symbol}] Failed to open {side} position level {grid_level}: {e}"
+                        )
+                        raise
+
+                # Track position
+                self.pm.add_position(
+                    side=side,
+                    entry_price=current_price,
+                    quantity=level_qty,
+                    grid_level=grid_level,
+                    order_id=order_id
+                )
+
+            self.logger.info(
+                f"✅ [{self.symbol}] Opened {side}: {len(levels_to_open)} levels, "
+                f"total ${target_margin:.2f} margin"
             )
 
-        self.logger.info(
-            f"✅ [{self.symbol}] Opened {side}: {len(levels_to_open)} levels, "
-            f"total ${target_margin:.2f} margin"
-        )
+            # Set TP order
+            self._update_tp_order(side)
 
-        # Set TP order
-        self._update_tp_order(side)
+            # Log to metrics
+            if self.metrics_tracker:
+                # Get ACTUAL total qty from position manager (uses reference qty)
+                # This ensures metrics match reality exactly
+                total_qty = self.pm.get_total_quantity(side)
 
-        # Log to metrics
-        if self.metrics_tracker:
-            # Calculate total quantity from all opened levels
-            total_qty = sum(
-                self._usd_to_qty(self.initial_size_usd * (self.multiplier ** level), current_price)
-                for level in levels_to_open
+                # Determine reason based on whether custom margin was used
+                if custom_margin_usd is not None:
+                    reason = f"Adaptive reopen (${target_margin:.2f})"
+                else:
+                    reason = "Initial position"
+
+                self.metrics_tracker.log_trade(
+                    symbol=self.symbol,
+                    side=side,
+                    action="OPEN",
+                    price=current_price,
+                    quantity=total_qty,
+                    reason=reason,
+                    pnl=None
+                )
+
+            # CRITICAL: Place pending for symmetry with opposite side
+            # This ensures money is reserved for missing levels
+            placed_count = self._place_pending_for_symmetry(
+                opened_side=side,
+                base_price=current_price
             )
 
-            # Determine reason based on whether custom margin was used
-            if custom_margin_usd is not None:
-                reason = f"Adaptive reopen (${target_margin:.2f})"
-            else:
-                reason = "Initial position"
+            if placed_count > 0:
+                self.logger.info(
+                    f"[{self.symbol}] ✅ Symmetry ensured: placed {placed_count} pending entries for {side}"
+                )
 
-            self.metrics_tracker.log_trade(
-                symbol=self.symbol,
-                side=side,
-                action="OPEN",
-                price=current_price,
-                quantity=total_qty,
-                reason=reason,
-                pnl=None
+            return True  # Success!
+
+        except Exception as e:
+            self.logger.error(
+                f"[{self.symbol}] ❌ Exception during {side} position opening: {e}",
+                exc_info=True
             )
+            return False  # Signal failure to caller
 
     def _check_grid_entries(self, current_price: float):
         """Check if we should add positions at grid levels"""
@@ -214,52 +278,67 @@ class OrderManagementMixin:
                 last_position_margin = last_position_value / self.leverage
                 new_margin_usd = last_position_margin * self.multiplier
 
-            # Convert margin to qty (with leverage applied)
-            new_size = self._usd_to_qty(new_margin_usd, current_price)
+            # Get grid level and use reference qty for perfect symmetry
             grid_level = self.pm.get_position_count(side)
+            # Use reference qty for perfect symmetry
+            new_size = self._get_qty_for_level(grid_level, side, current_price)
+            opposite_side = 'Sell' if side == 'Buy' else 'Buy'
 
-            # CRITICAL: Check safety reserve before averaging (account-level check)
+            # CRITICAL: Check balance for BOTH directions before averaging
+            # Must ensure we can:
+            # 1. Average current side
+            # 2. Place pending on opposite side for symmetry
             if not self.dry_run:
                 try:
-                    # Use account-level reserve check if TradingAccount is available
-                    # This accounts for ALL symbols and dynamic safety reserve
+                    # Total margin needed: averaging + pending on opposite
+                    total_margin_needed = new_margin_usd * 2
+
+                    # Use account-level thread-safe balance check
                     if self.trading_account:
-                        # Account-level check with safety reserve for ALL symbols
+                        # Multi-symbol atomic check with buffer
+                        if not self.trading_account.check_and_reserve_balance(
+                            symbol=self.symbol,
+                            margin_needed=total_margin_needed
+                        ):
+                            self.logger.warning(
+                                f"[{self.symbol}] ⚠️ Skipping {side} averaging to level {grid_level}: "
+                                f"insufficient balance for both sides (need ${total_margin_needed:.2f} with buffer)"
+                            )
+                            return
+
+                        # Also check reserve (for position balancing)
                         if not self.trading_account.check_reserve_before_averaging(
                             symbol=self.symbol,
                             side=side,
                             next_averaging_margin=new_margin_usd
                         ):
                             # Reserve check failed - don't place order
-                            # Warning already logged by check_reserve_before_averaging()
                             return
                     else:
                         # Fallback: Simple balance check (for tests and standalone mode)
-                        # This doesn't account for safety reserve!
                         available_balance = self.balance_manager.get_available_balance()
+                        buffer_multiplier = 1 + (self.balance_buffer_percent / 100.0)
+                        required_with_buffer = total_margin_needed * buffer_multiplier
 
-                        if new_margin_usd > available_balance:
-                            # Throttle warning to avoid spam (max once per minute)
+                        if available_balance < required_with_buffer:
+                            # Throttle warning to avoid spam
                             current_time = time.time()
-                            warning_key = f'insufficient_balance_{side}'
+                            warning_key = f'insufficient_balance_both_{side}'
                             if warning_key not in self._last_warning_time:
                                 self._last_warning_time[warning_key] = 0
 
                             if current_time - self._last_warning_time[warning_key] >= self._warning_interval:
                                 self.logger.warning(
-                                    LogMessages.INSUFFICIENT_BALANCE.format(
-                                        symbol=self.symbol,
-                                        side=side,
-                                        needed=new_margin_usd,
-                                        available=available_balance
-                                    )
+                                    f"[{self.symbol}] ⚠️ Skipping {side} averaging to level {grid_level}: "
+                                    f"need ${required_with_buffer:.2f} (both sides + buffer), "
+                                    f"available ${available_balance:.2f}"
                                 )
                                 self._last_warning_time[warning_key] = current_time
-                            return  # Don't place order
+                            return
 
                 except Exception as e:
-                    self.logger.error(f"[{self.symbol}] Failed to check balance/reserve before order: {e}")
-                    return  # Don't place order if we can't verify balance
+                    self.logger.error(f"[{self.symbol}] Failed to check balance before averaging: {e}")
+                    return
 
             self.logger.info(
                 f"[{self.symbol}] Executing grid order: {side} ${new_margin_usd:.2f} MARGIN ({new_size:.6f}) "
@@ -330,6 +409,23 @@ class OrderManagementMixin:
                     quantity=new_size,
                     reason=f"Grid level {grid_level}",
                     pnl=None
+                )
+
+            # CRITICAL: Place pending on opposite side for this same level (symmetry)
+            pending_id = self.place_pending_entry_order(
+                side=opposite_side,
+                grid_level=grid_level,
+                base_price=current_price
+            )
+
+            if not pending_id and not self.dry_run:
+                # Pending failed to place
+                # Not critical - averaging succeeded, just log warning
+                # Will be retried in next sync or when opposite side moves
+                self.logger.warning(
+                    f"[{self.symbol}] ⚠️ {side} averaged to level {grid_level}, "
+                    f"but failed to place pending on {opposite_side}. "
+                    f"Will retry in next sync."
                 )
 
             # Update TP order with new average entry
@@ -491,3 +587,261 @@ class OrderManagementMixin:
                 f"[{self.symbol}] [DRY RUN] Would place TP: {tp_side} {total_qty} @ ${tp_price:.4f}"
             )
             return "DRY_RUN_TP_ID"
+
+    def _cancel_all_pending_entries(self, side: str):
+        """
+        Cancel all pending entry orders for a side
+
+        Args:
+            side: 'Buy' or 'Sell'
+        """
+        with self._pending_entry_lock:
+            pending_orders = self._pending_entry_orders[side].copy()
+
+        if not pending_orders:
+            return  # Nothing to cancel
+
+        for level, order_id in pending_orders.items():
+            try:
+                if not self.dry_run:
+                    self.client.cancel_order(self.symbol, order_id, self.category)
+                    self.logger.info(
+                        f"[{self.symbol}] 🗑️ Cancelled pending entry: {side} level {level} (ID={order_id})"
+                    )
+            except Exception as e:
+                self.logger.warning(
+                    f"[{self.symbol}] Failed to cancel pending {order_id}: {e}"
+                )
+
+        # Clear tracking
+        with self._pending_entry_lock:
+            self._pending_entry_orders[side] = {}
+
+    def place_pending_entry_order(self, side: str, grid_level: int, base_price: float) -> Optional[str]:
+        """
+        Place pending limit order on specific grid level
+
+        Args:
+            side: 'Buy' or 'Sell'
+            grid_level: Grid level (3, 4, 5, ...)
+            base_price: Base price to calculate from
+
+        Returns:
+            order_id if successful, None if failed
+        """
+        # 1. Calculate entry price for pending
+        if side == 'Buy':  # LONG
+            entry_price = base_price * (1 - (self.grid_step_pct / 100) * grid_level)
+        else:  # SHORT
+            entry_price = base_price * (1 + (self.grid_step_pct / 100) * grid_level)
+
+        # 2. Get qty for this level (using reference for perfect symmetry)
+        level_qty = self._get_qty_for_level(grid_level, side, entry_price)
+        # Calculate actual margin based on qty (may differ slightly from target)
+        level_margin = (level_qty * entry_price) / self.leverage
+
+        # 3. Create limit order
+        position_idx = TradingConstants.POSITION_IDX_LONG if side == 'Buy' else TradingConstants.POSITION_IDX_SHORT
+
+        if self.dry_run:
+            # Dry run mode - simulate success
+            order_id = f"DRY_RUN_PENDING_{side}_{grid_level}"
+            with self._pending_entry_lock:
+                self._pending_entry_orders[side][grid_level] = order_id
+
+            self.logger.info(
+                f"[{self.symbol}] [DRY RUN] Would place pending entry: {side} level {grid_level} "
+                f"@ ${entry_price:.4f} (margin=${level_margin:.2f})"
+            )
+            return order_id
+
+        try:
+            response = self.client.place_order(
+                symbol=self.symbol,
+                side=side,
+                qty=level_qty,
+                order_type="Limit",
+                price=entry_price,
+                category=self.category,
+                position_idx=position_idx
+                # NOTE: timeInForce="GTC" is set automatically by place_order() for Limit orders
+            )
+
+            # Extract orderId from response
+            if response and 'result' in response:
+                order_id = response['result'].get('orderId')
+
+                if order_id:
+                    # Save in tracking
+                    with self._pending_entry_lock:
+                        self._pending_entry_orders[side][grid_level] = order_id
+
+                    self.logger.info(
+                        f"[{self.symbol}] 📋 Pending entry placed: {side} level {grid_level} "
+                        f"@ ${entry_price:.4f} (margin=${level_margin:.2f}, ID={order_id})"
+                    )
+                    return order_id
+
+            self.logger.error(
+                f"[{self.symbol}] Failed to place pending entry: invalid response {response}"
+            )
+            return None
+
+        except Exception as e:
+            self.logger.error(
+                f"[{self.symbol}] Exception placing pending entry {side} level {grid_level}: {e}"
+            )
+            return None
+
+    def _place_pending_for_symmetry(self, opened_side: str, base_price: float) -> int:
+        """
+        Place pending entry orders for symmetry with opposite side
+
+        Logic: If opposite on level 5, opened_side on level 2,
+        place pending on levels 3+4+5 for full money symmetry.
+
+        Args:
+            opened_side: Side that just opened ('Buy' or 'Sell')
+            base_price: Base price for calculation
+
+        Returns:
+            Number of pending orders placed
+        """
+        opposite_side = 'Sell' if opened_side == 'Buy' else 'Buy'
+
+        # Get max level on opposite
+        opposite_positions = (self.pm.long_positions if opposite_side == 'Buy'
+                             else self.pm.short_positions)
+
+        if not opposite_positions:
+            # No opposite positions - pending not needed
+            return 0
+
+        max_opposite_level = max(pos.grid_level for pos in opposite_positions)
+
+        # Get max level on opened_side
+        opened_positions = (self.pm.long_positions if opened_side == 'Buy'
+                           else self.pm.short_positions)
+
+        current_max_level = max(pos.grid_level for pos in opened_positions) if opened_positions else 0
+
+        # Missing levels for symmetry
+        missing_levels = list(range(current_max_level + 1, max_opposite_level + 1))
+
+        if not missing_levels:
+            # Already symmetric
+            return 0
+
+        # CRITICAL: Filter out levels that already have pending orders
+        # This prevents duplicate pending orders on periodic sync
+        with self._pending_entry_lock:
+            existing_pending_levels = set(self._pending_entry_orders[opened_side].keys())
+
+        levels_to_place = [level for level in missing_levels if level not in existing_pending_levels]
+
+        if not levels_to_place:
+            # All missing levels already have pending orders
+            self.logger.debug(
+                f"[{self.symbol}] All missing levels {missing_levels} for {opened_side} "
+                f"already have pending orders - skipping"
+            )
+            return 0
+
+        # Calculate total margin needed for pending orders we're about to place
+        total_pending_margin = sum(
+            self.initial_size_usd * (self.multiplier ** level)
+            for level in levels_to_place
+        )
+
+        # CRITICAL: Check balance WITH buffer
+        if not self.dry_run and self.trading_account:
+            buffer_multiplier = 1 + (self.balance_buffer_percent / 100.0)
+            required_margin_with_buffer = total_pending_margin * buffer_multiplier
+
+            available = self.balance_manager.get_available_balance()
+
+            if available < required_margin_with_buffer:
+                self.logger.warning(
+                    f"[{self.symbol}] ⚠️ Cannot place pending for symmetry: "
+                    f"need ${required_margin_with_buffer:.2f} (with {self.balance_buffer_percent}% buffer), "
+                    f"available ${available:.2f}"
+                )
+                return 0
+
+        # Place pending on each level that doesn't have pending order yet
+        placed_count = 0
+        for level in levels_to_place:
+            order_id = self.place_pending_entry_order(
+                side=opened_side,
+                grid_level=level,
+                base_price=base_price
+            )
+
+            if order_id:
+                placed_count += 1
+
+        # Save base price for this side
+        self._base_price_for_pending[opened_side] = base_price
+
+        if placed_count > 0:
+            self.logger.info(
+                f"[{self.symbol}] ✅ Placed {placed_count} pending entries for {opened_side} "
+                f"(levels {levels_to_place}) to match opposite side level {max_opposite_level}"
+            )
+
+        return placed_count
+
+    def _cancel_all_orders(self):
+        """
+        Cancel ALL active orders (TP + pending entry) for this symbol
+
+        Used on bot restart to ensure clean state.
+        Fetches orders directly from exchange (not from local tracking).
+        """
+        if self.dry_run:
+            self.logger.info(f"[{self.symbol}] [DRY RUN] Would cancel all orders")
+            return
+
+        try:
+            # Get all open orders for this symbol
+            open_orders = self.client.get_open_orders(self.symbol, self.category)
+
+            if not open_orders:
+                self.logger.info(f"[{self.symbol}] No open orders to cancel")
+                return
+
+            cancelled_count = 0
+            for order in open_orders:
+                order_id = order.get('orderId')
+                order_type = order.get('orderType')
+                reduce_only = order.get('reduceOnly', False)
+
+                try:
+                    self.logger.info(
+                        f"[{self.symbol}] 🗑️ Cancelling order: {order_id} "
+                        f"(type={order_type}, reduceOnly={reduce_only})"
+                    )
+                    self.client.cancel_order(self.symbol, order_id, self.category)
+                    cancelled_count += 1
+                except Exception as e:
+                    self.logger.warning(
+                        f"[{self.symbol}] Failed to cancel order {order_id}: {e}"
+                    )
+
+            if cancelled_count > 0:
+                self.logger.info(
+                    f"[{self.symbol}] ✅ Cancelled {cancelled_count} order(s) on restart cleanup"
+                )
+
+            # Clear local tracking
+            with self._tp_orders_lock:
+                self._tp_orders = {'Buy': None, 'Sell': None}
+
+            with self._pending_entry_lock:
+                self._pending_entry_orders = {'Buy': {}, 'Sell': {}}
+
+        except Exception as e:
+            self.logger.error(
+                f"[{self.symbol}] ❌ Error cancelling all orders: {e}",
+                exc_info=True
+            )

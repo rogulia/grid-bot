@@ -60,6 +60,46 @@ class CalculationsMixin:
 
         return final_qty
 
+    def _get_qty_for_level(self, grid_level: int, side: str, price: float) -> float:
+        """
+        Get quantity for specific grid level WITH reference qty checking
+
+        This ensures PERFECT qty symmetry: when level N opens on first side,
+        we save qty as reference. Second side ALWAYS uses the same qty.
+
+        Args:
+            grid_level: Grid level (0, 1, 2, ...)
+            side: 'Buy' or 'Sell' (for logging)
+            price: Current price (used if no reference exists)
+
+        Returns:
+            Quantity of coins (either reference or calculated)
+        """
+        # Check if reference exists for this level
+        with self._reference_qty_lock:
+            if grid_level in self._reference_qty_per_level:
+                # Reference exists - use it for perfect symmetry
+                ref_qty = self._reference_qty_per_level[grid_level]
+                self.logger.debug(
+                    f"[{self.symbol}] Using reference qty for {side} level {grid_level}: {ref_qty:.6f}"
+                )
+                return ref_qty
+
+        # No reference - calculate and save as reference
+        level_margin = self.initial_size_usd * (self.multiplier ** grid_level)
+        qty = self._usd_to_qty(level_margin, price)
+
+        # Save as reference for future symmetry
+        with self._reference_qty_lock:
+            self._reference_qty_per_level[grid_level] = qty
+
+        self.logger.debug(
+            f"[{self.symbol}] Created reference qty for {side} level {grid_level}: {qty:.6f} "
+            f"(margin=${level_margin:.2f} @ ${price:.4f})"
+        )
+
+        return qty
+
     def _qty_to_usd(self, qty: float, price: float) -> float:
         """
         Convert quantity of coins to USD amount
@@ -255,12 +295,14 @@ class CalculationsMixin:
 
         This keeps positions close but leaves margin for emergency balancing.
 
+        IMPORTANT: Checks available balance and caps reopen margin if insufficient funds.
+
         Args:
             closed_side: Side that closed ('Buy' or 'Sell')
             opposite_side: Side still open ('Sell' or 'Buy')
 
         Returns:
-            Reopen margin in USD
+            Reopen margin in USD (capped by available balance)
         """
         # Get opposite side positions to find max grid level
         opposite_positions = (self.pm.long_positions if opposite_side == 'Buy'
@@ -300,5 +342,25 @@ class CalculationsMixin:
             f"reopening to level {reopen_max_level} (${reopen_margin:.2f}), "
             f"reserving levels {reserved_levels} (${reserved_margin:.2f}) for balance"
         )
+
+        # ⚠️ CRITICAL: Check available balance and cap margin if insufficient
+        # This prevents calculate_reopen_size from returning unrealistic values
+        try:
+            if hasattr(self, 'balance_manager') and self.balance_manager:
+                available_balance = self.balance_manager.get_available_balance()
+
+                if reopen_margin > available_balance:
+                    original_margin = reopen_margin
+                    # Cap at available, but not below initial_size
+                    reopen_margin = max(self.initial_size_usd, available_balance)
+
+                    self.logger.warning(
+                        f"[{self.symbol}] ⚠️ Calculated reopen margin ${original_margin:.2f} "
+                        f"exceeds available balance ${available_balance:.2f}. "
+                        f"Capping at ${reopen_margin:.2f}"
+                    )
+        except Exception as e:
+            # Don't fail if balance check fails - just log and continue with calculated value
+            self.logger.debug(f"[{self.symbol}] Could not check balance in calculate_reopen_size: {e}")
 
         return reopen_margin

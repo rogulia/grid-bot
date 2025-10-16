@@ -40,6 +40,9 @@ class RestorationMixin:
 
         self.logger.info(f"🔄 [{self.symbol}] Restoring state from exchange @ ${current_price:.4f}...")
 
+        # CRITICAL: Set current_price BEFORE any operations that need it (e.g., reserve check)
+        self.current_price = current_price
+
         # Retry loop - WebSocket updates during restore trigger re-sync
         max_retries = 3
         retry_count = 0
@@ -111,95 +114,50 @@ class RestorationMixin:
                             f"🆕 [{self.symbol}] No {side} position exists - opening initial position"
                         )
 
-                        # Check balance before opening
-                        if not self.dry_run and available_balance < self.initial_size_usd:
+                        # ADAPTIVE REOPEN: Check if opposite side has positions
+                        # If yes: use adaptive reopen (minus two steps)
+                        # If no: use initial size
+                        opposite_side = 'Sell' if side == 'Buy' else 'Buy'
+                        opposite_positions = (self.pm.long_positions if opposite_side == 'Buy'
+                                            else self.pm.short_positions)
+
+                        if opposite_positions:
+                            # Opposite side exists - use adaptive reopen logic
+                            reopen_margin = self.calculate_reopen_size(side, opposite_side)
+                            self.logger.info(
+                                f"🔧 [{self.symbol}] ADAPTIVE REOPEN: {side} with ${reopen_margin:.2f} margin "
+                                f"(opposite has {len(opposite_positions)} levels)"
+                            )
+                        else:
+                            # No opposite - just use initial size
+                            reopen_margin = self.initial_size_usd
+                            self.logger.info(
+                                f"🆕 [{self.symbol}] INITIAL OPEN: {side} with ${reopen_margin:.2f} margin"
+                            )
+
+                        # Use _open_initial_position() which handles:
+                        # - Reference qty for perfect symmetry ✅
+                        # - Balance checks with buffer ✅
+                        # - Opening positions by grid levels ✅
+                        # - Creating TP orders ✅
+                        # - Placing pending for symmetry ✅
+                        # - Logging to metrics ✅
+                        success = self._open_initial_position(
+                            side=side,
+                            current_price=current_price,
+                            custom_margin_usd=reopen_margin
+                        )
+
+                        if not success:
+                            # _open_initial_position failed (balance check or exception)
                             reason = (
-                                f"Insufficient balance to start trading: "
-                                f"need ${self.initial_size_usd:.2f} MARGIN for initial position, "
-                                f"available ${available_balance:.2f}"
+                                f"Failed to open initial {side} position - "
+                                f"insufficient balance or exception occurred"
                             )
                             self.logger.error(f"❌ [{self.symbol}] {reason}")
                             self._create_emergency_stop_flag(reason)
                             self.emergency_stopped = True
                             raise RuntimeError(f"[{self.symbol}] {reason}")
-
-                        # Open initial position
-                        initial_qty = self._usd_to_qty(self.initial_size_usd, current_price)
-                        self.logger.info(
-                            f"🆕 [{self.symbol}] Opening initial {side} position: ${self.initial_size_usd} "
-                            f"({initial_qty:.6f} {self.symbol}) @ ${current_price:.4f}"
-                        )
-
-                        order_id = None
-                        if not self.dry_run:
-                            try:
-                                position_idx = TradingConstants.POSITION_IDX_LONG if side == 'Buy' else TradingConstants.POSITION_IDX_SHORT
-
-                                # Use limit order with retry
-                                order_id = self.limit_order_manager.place_limit_order(
-                                    side=side,
-                                    qty=initial_qty,
-                                    current_price=current_price,
-                                    reason="Initial position (restore)",
-                                    position_idx=position_idx
-                                )
-
-                                if not order_id:
-                                    # Fallback to market order
-                                    self.logger.warning(
-                                        f"[{self.symbol}] Limit order failed for initial {side}, using market order"
-                                    )
-                                    response = self.client.place_order(
-                                        symbol=self.symbol,
-                                        side=side,
-                                        qty=initial_qty,
-                                        order_type="Market",
-                                        category=self.category,
-                                        position_idx=position_idx
-                                    )
-                                    if response and 'result' in response:
-                                        order_id = response['result'].get('orderId')
-
-                                # Track position locally
-                                self.pm.add_position(
-                                    side=side,
-                                    entry_price=current_price,
-                                    quantity=initial_qty,
-                                    grid_level=0,
-                                    order_id=order_id
-                                )
-
-                                # Create TP order
-                                tp_id = self._update_tp_order(side, force_cancel_all=True)
-                                if not tp_id:
-                                    raise RuntimeError(
-                                        f"Failed to create TP order for initial {side} position"
-                                    )
-
-                                # Log trade
-                                self.metrics_tracker.log_trade(
-                                    timestamp=datetime.now(),
-                                    symbol=self.symbol,
-                                    side=side,
-                                    action='OPEN',
-                                    price=current_price,
-                                    quantity=initial_qty,
-                                    reason='Initial position (restore)'
-                                )
-
-                            except Exception as e:
-                                reason = f"Failed to open initial {side} position: {e}"
-                                self.logger.error(f"❌ [{self.symbol}] {reason}")
-                                raise RuntimeError(f"[{self.symbol}] {reason}") from e
-                        else:
-                            # Dry run
-                            self.pm.add_position(
-                                side=side,
-                                entry_price=current_price,
-                                quantity=initial_qty,
-                                grid_level=0,
-                                order_id=None
-                            )
 
                     # SCENARIO 2: Positions synced
                     elif qty_diff <= tolerance:
@@ -403,6 +361,15 @@ class RestorationMixin:
                     grid_level=grid_level,
                     order_id=order_id
                 )
+
+                # CRITICAL: Save reference qty for perfect symmetry
+                # This ensures opposite side will use same qty on this level
+                with self._reference_qty_lock:
+                    if grid_level not in self._reference_qty_per_level:
+                        self._reference_qty_per_level[grid_level] = qty
+                        self.logger.debug(
+                            f"[{self.symbol}] Restored reference qty for level {grid_level}: {qty:.6f}"
+                        )
 
             # Create TP order for restored position
             if not self.dry_run:
@@ -679,6 +646,23 @@ class RestorationMixin:
             self._is_syncing = True
 
         try:
+            # CRITICAL: On first sync after bot restart, cancel ALL orders (TP + pending)
+            # Orders may be outdated if bot was offline for a while
+            if not self._first_sync_done:
+                self.logger.info(
+                    f"[{self.symbol}] 🔄 First sync after restart - cancelling all existing orders"
+                )
+                self._cancel_all_orders()
+
+                # CRITICAL: Clear local TP order IDs so they get recreated below
+                # Without this, verification logic thinks TP orders still exist
+                with self._tp_orders_lock:
+                    self._tp_orders = {'Buy': None, 'Sell': None}
+                self.pm.set_tp_order_id('Buy', None)
+                self.pm.set_tp_order_id('Sell', None)
+
+                self._first_sync_done = True
+
             self.logger.debug(f"[{self.symbol}] Periodic sync with exchange...")
 
             for side in ['Buy', 'Sell']:
@@ -750,33 +734,22 @@ class RestorationMixin:
 
                     # Reopen position if not in emergency stop
                     if not self.emergency_stopped and not self.dry_run:
-                        try:
-                            # Calculate adaptive reopen size
-                            opposite_side = 'Sell' if side == 'Buy' else 'Buy'
-                            reopen_margin = self.calculate_reopen_size(side, opposite_side)
+                        # Calculate adaptive reopen size
+                        opposite_side = 'Sell' if side == 'Buy' else 'Buy'
+                        reopen_margin = self.calculate_reopen_size(side, opposite_side)
 
-                            # Check reserve before reopen (prevent "insufficient balance" error)
-                            if self.trading_account and not self.trading_account.check_reserve_before_averaging(
-                                symbol=self.symbol,
-                                side=side,
-                                next_averaging_margin=reopen_margin
-                            ):
-                                self.logger.warning(
-                                    f"[{self.symbol}] Reserve check failed for missed-close reopen ({side}), need ${reopen_margin:.2f}"
-                                )
-                                continue  # Skip reopen, will retry in next sync cycle
+                        self.logger.info(
+                            f"🆕 [{self.symbol}] ADAPTIVE REOPEN (missed close): {side} with ${reopen_margin:.2f} margin"
+                        )
 
-                            self.logger.info(
-                                f"🆕 [{self.symbol}] ADAPTIVE REOPEN (missed close): {side} with ${reopen_margin:.2f} margin"
-                            )
+                        # Use _open_initial_position() which handles reserve checks internally
+                        success = self._open_initial_position(
+                            side=side,
+                            current_price=current_price,
+                            custom_margin_usd=reopen_margin
+                        )
 
-                            # Reopen with custom margin
-                            self._open_initial_position(
-                                side=side,
-                                current_price=current_price,
-                                custom_margin_usd=reopen_margin
-                            )
-
+                        if success:
                             # Set debounce - prevent duplicate reopen for 3 seconds
                             with self._sync_lock:
                                 self._just_reopened_until_ts[side] = now + 3.0
@@ -784,10 +757,11 @@ class RestorationMixin:
                             self.logger.info(
                                 f"✅ [{self.symbol}] Reopened {side} after untracked close with ${reopen_margin:.2f} margin"
                             )
-
-                        except Exception as e:
-                            self.logger.error(
-                                f"❌ [{self.symbol}] Failed to reopen {side} after untracked close: {e}"
+                        else:
+                            # Failed to reopen - will retry in next sync cycle
+                            self.logger.warning(
+                                f"⚠️ [{self.symbol}] Failed to reopen {side} after untracked close. "
+                                f"Will retry in next sync cycle (60s)."
                             )
 
                 # SCENARIO 3: Other mismatches - log warning (should have been caught at startup)
@@ -828,10 +802,11 @@ class RestorationMixin:
                 long_count = self.pm.get_position_count('Buy')
                 short_count = self.pm.get_position_count('Sell')
 
-                # Check for severe imbalance (one side has positions, other is empty)
+                # Check for imbalance (one side has positions, other is empty)
+                # ⚠️ FIXED: Changed from >= 2 to >= 1 (any imbalance is a problem!)
                 is_severely_unbalanced = (
-                    (long_count >= 2 and short_count == 0) or
-                    (short_count >= 2 and long_count == 0)
+                    (long_count >= 1 and short_count == 0) or
+                    (short_count >= 1 and long_count == 0)
                 )
 
                 # Check if we have recorded failed reopening
@@ -853,48 +828,51 @@ class RestorationMixin:
                             f"Attempting to reopen {missing_side}..."
                         )
 
-                        try:
-                            # Calculate reopen size
-                            opposite_side = 'Sell' if missing_side == 'Buy' else 'Buy'
-                            reopen_margin = self.calculate_reopen_size(missing_side, opposite_side)
+                        # Calculate reopen size
+                        opposite_side = 'Sell' if missing_side == 'Buy' else 'Buy'
+                        reopen_margin = self.calculate_reopen_size(missing_side, opposite_side)
 
-                            # Check reserve
-                            if self.trading_account and not self.trading_account.check_reserve_before_averaging(
-                                symbol=self.symbol,
-                                side=missing_side,
-                                next_averaging_margin=reopen_margin
-                            ):
-                                self.logger.warning(
-                                    f"[{self.symbol}] Reserve check failed for recovery reopen ({missing_side}), "
-                                    f"need ${reopen_margin:.2f}. Will retry in next sync."
-                                )
-                            else:
-                                # Attempt recovery reopen
-                                self.logger.info(
-                                    f"🆕 [{self.symbol}] RECOVERY REOPEN: {missing_side} "
-                                    f"with ${reopen_margin:.2f} margin"
-                                )
+                        self.logger.info(
+                            f"🆕 [{self.symbol}] RECOVERY REOPEN: {missing_side} "
+                            f"with ${reopen_margin:.2f} margin"
+                        )
 
-                                self._open_initial_position(
-                                    side=missing_side,
-                                    current_price=current_price,
-                                    custom_margin_usd=reopen_margin
-                                )
+                        # Use _open_initial_position() which handles reserve checks and fallback internally
+                        success = self._open_initial_position(
+                            side=missing_side,
+                            current_price=current_price,
+                            custom_margin_usd=reopen_margin
+                        )
 
-                                # SUCCESS - clear failed flag
-                                if missing_side in failed_reopen_sides:
-                                    failed_reopen_sides.remove(missing_side)
+                        if success:
+                            # SUCCESS - clear failed flag
+                            if missing_side in failed_reopen_sides:
+                                failed_reopen_sides.remove(missing_side)
 
-                                self.logger.info(
-                                    f"✅ [{self.symbol}] RECOVERY SUCCESS: Reopened {missing_side} "
-                                    f"with ${reopen_margin:.2f} margin"
-                                )
-
-                        except Exception as e:
+                            self.logger.info(
+                                f"✅ [{self.symbol}] RECOVERY SUCCESS: Reopened {missing_side} "
+                                f"with ${reopen_margin:.2f} margin"
+                            )
+                        else:
+                            # Failed - will retry in next sync cycle
                             self.logger.error(
-                                f"❌ [{self.symbol}] RECOVERY FAILED: Could not reopen {missing_side}: {e}. "
+                                f"❌ [{self.symbol}] RECOVERY FAILED: Could not reopen {missing_side}. "
                                 f"Will retry in next sync cycle (60s)."
                             )
+
+            # CRITICAL: Restore pending orders for symmetry (if missing)
+            # This ensures positions are always balanced with reserved pending
+            for side in ['Buy', 'Sell']:
+                if self.pm.get_position_count(side) > 0:
+                    # Position exists - check if pending needed
+                    placed_count = self._place_pending_for_symmetry(
+                        opened_side=side,
+                        base_price=current_price
+                    )
+                    if placed_count > 0:
+                        self.logger.info(
+                            f"[{self.symbol}] 🔄 Restored {placed_count} pending entries for {side} during sync"
+                        )
 
         finally:
             # Clear syncing flag

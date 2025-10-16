@@ -55,7 +55,10 @@ Called **every 60 seconds** during operation via `sync_with_exchange()`:
 grid_strategy.sync_with_exchange(current_price)
 ```
 
-**Purpose:** Detect untracked closes (WebSocket missed event).
+**Purpose:**
+- Detect untracked closes (WebSocket missed event)
+- On **first sync after restart**: Cancel ALL existing orders (TP + pending entry)
+- Restore pending entry orders for position symmetry
 
 ---
 
@@ -775,12 +778,72 @@ Remove flag file after resolving issue: rm data/.001_emergency_stop
 |--------|----------------|---------------|
 | **When** | Startup (before WebSocket) | Every 60s (during operation) |
 | **Method** | `restore_state_from_exchange()` | `sync_with_exchange()` |
-| **Purpose** | Restore state after restart | Detect untracked closes |
+| **Purpose** | Restore state after restart | Detect untracked closes + cleanup |
 | **Retry** | Yes (3 attempts) | No (single check) |
 | **Fail Behavior** | Emergency stop | Warning + recovery attempt |
 | **WebSocket** | Not started yet | Already running |
+| **First Sync** | N/A | Cancels ALL orders (TP + pending) |
 
 ### Periodic Sync Features
+
+**0. First Sync: Order Cleanup (Bot Restart)**
+
+On the **very first** sync after bot restart, all existing orders are cancelled:
+
+```python
+# CRITICAL: On first sync after bot restart, cancel ALL orders (TP + pending)
+# Orders may be outdated if bot was offline for a while
+if not self._first_sync_done:
+    self.logger.info(
+        f"[{self.symbol}] 🔄 First sync after restart - cancelling all existing orders"
+    )
+    self._cancel_all_orders()
+
+    # CRITICAL: Clear local TP order IDs so they get recreated below
+    # Without this, verification logic thinks TP orders still exist
+    with self._tp_orders_lock:
+        self._tp_orders = {'Buy': None, 'Sell': None}
+    self.pm.set_tp_order_id('Buy', None)
+    self.pm.set_tp_order_id('Sell', None)
+
+    self._first_sync_done = True
+```
+
+**Why?** After bot restart, existing orders may be outdated:
+- TP orders at wrong prices (average entry may have changed)
+- Pending entry orders at wrong levels (price moved during downtime)
+- Orders left from previous bot version
+
+**What gets cancelled:**
+- All Take Profit orders (reduceOnly=True)
+- All Pending Entry orders (reduceOnly=False)
+
+**CRITICAL FIX (2025-10-16):**
+After cancelling all orders, **local TP order IDs must be cleared**. Without this:
+1. `_cancel_all_orders()` cancels TP orders on exchange ✅
+2. Local IDs remain in `_tp_orders` and `pm.tp_order_id` ❌
+3. Verification checks `if not tp_order_id` → False (ID exists!) ❌
+4. TP orders **NOT recreated** → positions have NO PROTECTION ❌
+
+**Log Example:**
+```
+2025-10-16 10:15:23 - INFO - [DOGEUSDT] 🔄 First sync after restart - cancelling all existing orders
+2025-10-16 10:15:23 - INFO - [DOGEUSDT] 🗑️ Cancelling order: 1a2b3c4d (type=Limit, reduceOnly=True)
+2025-10-16 10:15:23 - INFO - [DOGEUSDT] 🗑️ Cancelling order: 5e6f7g8h (type=Limit, reduceOnly=False)
+2025-10-16 10:15:23 - INFO - [DOGEUSDT] ✅ Cancelled 2 order(s) on restart cleanup
+2025-10-16 10:15:24 - WARNING - ⚠️  [DOGEUSDT] TP order missing for Buy position (qty=46228.0) - creating
+2025-10-16 10:15:24 - INFO - [DOGEUSDT] ✅ TP order created: Sell 46228.0 @ $0.2002 (ID: abc123)
+2025-10-16 10:15:24 - WARNING - ⚠️  [DOGEUSDT] TP order missing for Sell position (qty=1155.0) - creating
+2025-10-16 10:15:24 - INFO - [DOGEUSDT] ✅ TP order created: Buy 1155.0 @ $0.1939 (ID: def456)
+```
+
+After cleanup, bot proceeds to:
+1. Verify positions match exchange
+2. **Detect missing TP orders** (IDs cleared)
+3. Create fresh TP orders at correct prices ✅
+4. Place new pending entry orders for symmetry
+
+---
 
 **1. Untracked Close Detection**
 
@@ -841,6 +904,27 @@ with self._sync_lock:
         self.logger.debug(f"Skipping reopen for {side} (debounce)")
         continue
 ```
+
+**5. Pending Entry Order Restoration**
+
+At the end of each sync, bot checks if pending entry orders need to be restored:
+
+```python
+# CRITICAL: Restore pending orders for symmetry (if missing)
+for side in ['Buy', 'Sell']:
+    if self.pm.get_position_count(side) > 0:
+        # Position exists - check if pending needed
+        placed_count = self._place_pending_for_symmetry(
+            opened_side=side,
+            base_price=current_price
+        )
+        if placed_count > 0:
+            self.logger.info(
+                f"[{self.symbol}] 🔄 Restored {placed_count} pending entries for {side} during sync"
+            )
+```
+
+**Why?** Ensures positions are always balanced with reserved pending orders. See detailed docs: `13-position-lifecycle.md`
 
 ### Log Examples
 
@@ -1218,6 +1302,55 @@ Position restoration is a **critical safety mechanism** that ensures data integr
 
 ---
 
-**Document Version:** 1.0
-**Last Updated:** 2025-10-15
+## Critical Fixes & Improvements
+
+### Fix: Missing TP Orders After Restart (2025-10-16)
+
+**Problem:**
+After bot restart, TP orders were created during restoration but cancelled during first sync and NOT recreated, leaving positions unprotected.
+
+**Root Cause:**
+```python
+# Restoration creates TP orders
+restore_state_from_exchange()
+  → TP created with IDs: abc123, def456
+  → IDs saved in memory
+
+# First sync cancels all orders
+sync_with_exchange()
+  → _cancel_all_orders()  # Cancels on exchange ✅
+  → IDs remain in _tp_orders dict ❌
+
+# Verification fails
+if not tp_order_id:  # FALSE - IDs exist! ❌
+    _update_tp_order(side)  # NOT CALLED
+```
+
+**Fix:**
+Clear local TP IDs after cancelling:
+```python
+if not self._first_sync_done:
+    self._cancel_all_orders()
+
+    # Clear local IDs
+    with self._tp_orders_lock:
+        self._tp_orders = {'Buy': None, 'Sell': None}
+    self.pm.set_tp_order_id('Buy', None)
+    self.pm.set_tp_order_id('Sell', None)
+```
+
+**Impact:**
+- ✅ TP orders always recreated after restart
+- ✅ Positions never left unprotected
+- ✅ Risk management maintained
+
+**Files Modified:**
+- `src/strategy/grid_strategy/restoration.py:657-662`
+
+**See Also:** `docs/13-position-lifecycle.md` for related pending orders fix.
+
+---
+
+**Document Version:** 1.1
+**Last Updated:** 2025-10-16
 **Author:** SOL-Trader Development Team

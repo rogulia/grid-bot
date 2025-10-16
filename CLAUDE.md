@@ -112,6 +112,17 @@ Each new position size = last position size × multiplier
 **4. Symbol Prefixes in All Logs:**
 Every log message includes `[{self.symbol}]` prefix for multi-symbol trading clarity.
 
+**5. Reference Qty for Perfect Hedging:**
+The bot uses **Reference Qty Per Level** system to ensure LONG and SHORT have identical quantities on each grid level.
+- When first side opens level N → saves qty as reference: `_reference_qty_per_level[N] = qty`
+- When second side opens level N → uses saved reference qty (not calculated from margin)
+- **Result:** Perfect qty symmetry regardless of price difference
+- **Example:** LONG @ $0.21 = 357 coins, SHORT @ $0.20 = 357 coins ✅ (not 375!)
+- **Benefit:** True hedging - equal P&L on price moves, weighted average TP works correctly
+- **Persistence:** Reference restored from position history on bot restart
+
+**Why:** In dual-sided hedge strategy, having different quantities on each side means imperfect hedging. A $0.01 price move would affect sides differently, breaking the hedge. Reference qty ensures mathematical symmetry.
+
 ### Position Lifecycle
 
 - **Entry**: Initial positions opened in `main.py::initialize()` at startup
