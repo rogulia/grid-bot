@@ -21,6 +21,10 @@ class WebSocketHandlersMixin:
         # Update price history for ATR calculation (Phase 1: Advanced Risk Management)
         self._update_price_history(current_price)
 
+        # Check for pending order recalculation on large price moves (>5%)
+        # This prevents pending orders from becoming too far from market
+        self._check_pending_recalculation(current_price)
+
         # Update current price for all tracked limit orders (for retry logic)
         # This ensures retries use fresh market price
         if hasattr(self, 'limit_order_manager'):
@@ -209,9 +213,16 @@ class WebSocketHandlersMixin:
             self.pm.remove_all_positions(closed_position_side)
             self.pm.set_tp_order_id(closed_position_side, None)
 
-            # CRITICAL: Cancel all pending entry orders for this side
-            # Position is closed - pending orders are no longer valid
-            self._cancel_all_pending_entries(closed_position_side)
+            # Check if BOTH sides are now empty - clear reference quantities for fresh start
+            if not self.pm.has_positions("Buy") and not self.pm.has_positions("Sell"):
+                self.logger.info(f"[{self.symbol}] Both sides empty after close - clearing reference quantities")
+                self.clear_reference_quantities()
+
+            # CRITICAL: Cancel ALL pending entry orders (BOTH sides) before reopen
+            # This prevents orphaned pending orders from opposite side
+            self.logger.info(f"[{self.symbol}] ✅ Cancelling ALL pending entries (both sides) before reopen")
+            self._cancel_all_pending_entries("Buy")   # LONG
+            self._cancel_all_pending_entries("Sell")  # SHORT
 
             # Reopen initial position if needed
             # Get current price (could be from WebSocket or this execution price)
@@ -461,24 +472,15 @@ class WebSocketHandlersMixin:
                         is_syncing = self._is_syncing
 
                     if is_syncing:
-                        # Position update during restore - trigger re-sync
-                        with self._resync_lock:
-                            self._needs_resync = True
-                            self._resync_triggers.append({
-                                'timestamp': now_helsinki().isoformat(),
-                                'event': 'position_update',
-                                'side': side,
-                                'size': size_float,
-                                'avgPrice': avg_price
-                            })
-
+                        # Position update during sync/restore - DON'T block, allow sync to detect and fix
+                        # Removed _needs_resync trigger to prevent infinite loops
                         self.logger.info(
-                            f"[{self.symbol}] Position update during restore: {side} size={size_float} "
-                            f"@ ${avg_price} - will re-sync"
+                            f"[{self.symbol}] Position update during sync: {side} size={size_float} "
+                            f"@ ${avg_price} - sync_with_exchange() will handle mismatch if needed"
                         )
                         return
 
-                    # Position exists on exchange but not tracked locally (and NOT during restore)
+                    # Position exists on exchange but not tracked locally (and NOT during sync)
                     # This should NEVER happen - positions should ONLY be restored via REST API in restore/sync
                     # WebSocket should only update existing positions, not create new ones
                     self.logger.error(
@@ -730,6 +732,17 @@ class WebSocketHandlersMixin:
                 else:
                     return  # Unknown position index
 
+                # Check if TP tracking is in PENDING state (race condition prevention)
+                with self._tp_orders_lock:
+                    tracked_tp_id = self._tp_orders.get(track_side)
+
+                if tracked_tp_id == "PENDING":
+                    # TP order is being created - skip WebSocket update to avoid race
+                    self.logger.debug(
+                        f"[{self.symbol}] Skipping TP order update - tracking not ready (PENDING state)"
+                    )
+                    return
+
                 if order_status == 'New':
                     # New TP order created - track it
                     with self._tp_orders_lock:
@@ -761,3 +774,85 @@ class WebSocketHandlersMixin:
                 f"[{self.symbol}] Error processing order update: {e}",
                 exc_info=True
             )
+
+    def _check_pending_recalculation(self, current_price: float):
+        """
+        Check if pending orders need recalculation due to large price moves
+
+        If price moved >5% since pending orders were placed, cancel and recalculate
+        them at current market price to ensure they stay close to market.
+
+        Args:
+            current_price: Current market price
+        """
+        # Initialize price tracking dict if not exists
+        if not hasattr(self, '_last_pending_check_price'):
+            self._last_pending_check_price = {
+                "Buy": current_price,
+                "Sell": current_price
+            }
+
+        # Check each side for recalculation need
+        for side in ["Buy", "Sell"]:
+            with self._pending_entry_lock:
+                pending_orders = dict(self._pending_entry_orders.get(side, {}))
+
+            if not pending_orders:
+                # No pending orders for this side, update last check price
+                self._last_pending_check_price[side] = current_price
+                continue
+
+            # Calculate price move since last check
+            last_price = self._last_pending_check_price[side]
+            if last_price <= 0:
+                # Invalid last price, reset
+                self._last_pending_check_price[side] = current_price
+                continue
+
+            price_change_pct = abs((current_price - last_price) / last_price * 100)
+
+            # Recalculate if price moved >5%
+            if price_change_pct > 5.0:
+                self.logger.info(
+                    f"[{self.symbol}] Price moved {price_change_pct:.2f}% - "
+                    f"recalculating {len(pending_orders)} pending {side} orders"
+                )
+
+                # Cancel old pending orders
+                self._cancel_all_pending_entries(side)
+
+                # Recalculate and place new pending orders
+                # Only if position still exists on this side
+                if self.pm.has_positions(side):
+                    # Get current position levels
+                    positions = self.pm.long_positions if side == 'Buy' else self.pm.short_positions
+                    max_level = max(pos.grid_level for pos in positions) if positions else 0
+
+                    # Place pending for each level that opposite side hasn't filled yet
+                    opposite_side = 'Sell' if side == 'Buy' else 'Buy'
+                    opposite_positions = self.pm.short_positions if opposite_side == 'Sell' else self.pm.long_positions
+                    opposite_max_level = max(pos.grid_level for pos in opposite_positions) if opposite_positions else 0
+
+                    # Place pending orders for levels where opposite side is ahead
+                    if opposite_max_level > max_level:
+                        levels_to_place = list(range(max_level + 1, opposite_max_level + 1))
+                        base_price = current_price
+
+                        placed_count = 0
+                        for level in levels_to_place:
+                            order_id = self.place_pending_entry_order(
+                                side=side,
+                                grid_level=level,
+                                base_price=base_price
+                            )
+                            if order_id:
+                                placed_count += 1
+
+                        if placed_count > 0:
+                            self.logger.info(
+                                f"[{self.symbol}] ✅ Recalculated and placed {placed_count} pending {side} orders "
+                                f"at new price ${current_price:.4f}"
+                            )
+
+                # Update last check price
+                self._last_pending_check_price[side] = current_price

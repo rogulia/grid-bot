@@ -288,31 +288,21 @@ class OrderManagementMixin:
             # Must ensure we can:
             # 1. Average current side
             # 2. Place pending on opposite side for symmetry
+            # 3. Still have reserve for position balancing after
             if not self.dry_run:
                 try:
-                    # Total margin needed: averaging + pending on opposite
-                    total_margin_needed = new_margin_usd * 2
-
-                    # Use account-level thread-safe balance check
+                    # Use comprehensive reserve check (includes buffer, simulates averaging, checks balancing ability)
                     if self.trading_account:
-                        # Multi-symbol atomic check with buffer
-                        if not self.trading_account.check_and_reserve_balance(
-                            symbol=self.symbol,
-                            margin_needed=total_margin_needed
-                        ):
-                            self.logger.warning(
-                                f"[{self.symbol}] ⚠️ Skipping {side} averaging to level {grid_level}: "
-                                f"insufficient balance for both sides (need ${total_margin_needed:.2f} with buffer)"
-                            )
-                            return
-
-                        # Also check reserve (for position balancing)
                         if not self.trading_account.check_reserve_before_averaging(
                             symbol=self.symbol,
                             side=side,
                             next_averaging_margin=new_margin_usd
                         ):
-                            # Reserve check failed - don't place order
+                            # Reserve check failed - insufficient balance after accounting for all factors
+                            self.logger.warning(
+                                f"[{self.symbol}] ⚠️ Skipping {side} averaging to level {grid_level}: "
+                                f"reserve check failed (need ${new_margin_usd:.2f} + reserve for balancing)"
+                            )
                             return
                     else:
                         # Fallback: Simple balance check (for tests and standalone mode)
@@ -554,6 +544,11 @@ class OrderManagementMixin:
 
         # Place new TP order
         if not self.dry_run:
+            # Pre-fill tracking with placeholder to prevent race condition
+            # (WebSocket update can arrive before we set the real ID)
+            with self._tp_orders_lock:
+                self._tp_orders[side] = "PENDING"
+
             new_tp_id = self.client.place_tp_order(
                 symbol=self.symbol,
                 side=tp_side,
@@ -566,8 +561,7 @@ class OrderManagementMixin:
             if new_tp_id:
                 # TP created successfully - save ID
                 self.pm.set_tp_order_id(side, new_tp_id)
-                # Also update Order WebSocket tracking
-                # (WebSocket will confirm, but we pre-fill for immediate availability)
+                # Update placeholder with real ID
                 with self._tp_orders_lock:
                     self._tp_orders[side] = new_tp_id
 
@@ -577,7 +571,10 @@ class OrderManagementMixin:
                 )
                 return new_tp_id
             else:
-                # TP creation failed - log error but don't save None
+                # TP creation failed - remove placeholder
+                with self._tp_orders_lock:
+                    self._tp_orders.pop(side, None)
+
                 self.logger.error(
                     f"[{self.symbol}] ❌ Failed to create TP order for {side} - place_tp_order returned None!"
                 )

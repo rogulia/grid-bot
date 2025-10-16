@@ -1466,6 +1466,37 @@ class TradingAccount:
             return self.metrics_tracker.generate_daily_report(date)
         return None
 
+    def pause_all_websockets(self):
+        """
+        Pause all WebSocket callbacks for this account
+
+        Used during sync_with_exchange() to prevent WebSocket events from
+        triggering resync loops during restore.
+        """
+        # Pause Private WebSocket (Execution stream)
+        if self.private_ws:
+            self.private_ws.pause_callbacks()
+
+        # Pause all Position WebSockets (Position/Wallet/Order streams)
+        for symbol, position_ws in self.position_websockets.items():
+            position_ws.pause_callbacks()
+
+        self.logger.debug(f"[Account {self.id_str}] All WebSocket callbacks PAUSED")
+
+    def resume_all_websockets(self):
+        """
+        Resume all WebSocket callbacks after sync completes
+        """
+        # Resume Private WebSocket
+        if self.private_ws:
+            self.private_ws.resume_callbacks()
+
+        # Resume all Position WebSockets
+        for symbol, position_ws in self.position_websockets.items():
+            position_ws.resume_callbacks()
+
+        self.logger.debug(f"[Account {self.id_str}] All WebSocket callbacks RESUMED")
+
     async def shutdown(self):
         """
         Graceful shutdown of account

@@ -938,6 +938,10 @@ class RestorationMixin:
         with self._sync_lock:
             self._is_syncing = True
 
+        # Pause WebSocket callbacks to prevent resync loops
+        if self.trading_account:
+            self.trading_account.pause_all_websockets()
+
         try:
             # CRITICAL: On first sync after bot restart, cancel ALL orders (TP + pending)
             # Orders may be outdated if bot was offline for a while
@@ -1171,3 +1175,7 @@ class RestorationMixin:
             # Clear syncing flag
             with self._sync_lock:
                 self._is_syncing = False
+
+            # Resume WebSocket callbacks
+            if self.trading_account:
+                self.trading_account.resume_all_websockets()

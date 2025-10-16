@@ -55,6 +55,10 @@ class BybitPrivateWebSocket:
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._stop_heartbeat = threading.Event()
 
+        # Callback pause mechanism (for restore/sync operations)
+        self._callbacks_paused = False
+        self._pause_lock = threading.Lock()
+
     def _handle_execution(self, message: dict):
         """
         Handle incoming execution messages
@@ -63,6 +67,11 @@ class BybitPrivateWebSocket:
             message: WebSocket message from Bybit
         """
         try:
+            # Check if callbacks are paused (during restore/sync)
+            with self._pause_lock:
+                if self._callbacks_paused:
+                    return  # Skip callback processing during restore
+
             # Validate message structure
             if 'topic' not in message:
                 self.logger.warning(f"Message without topic: {message}")
@@ -251,3 +260,22 @@ class BybitPrivateWebSocket:
     def is_connected(self) -> bool:
         """Check if WebSocket is connected"""
         return self._connected
+
+    def pause_callbacks(self):
+        """
+        Pause all callback execution (for restore/sync operations)
+
+        Used during sync_with_exchange() to prevent WebSocket events from
+        triggering resync loops during restore.
+        """
+        with self._pause_lock:
+            self._callbacks_paused = True
+        self.logger.debug("Private WebSocket callbacks PAUSED")
+
+    def resume_callbacks(self):
+        """
+        Resume callback execution after restore/sync completes
+        """
+        with self._pause_lock:
+            self._callbacks_paused = False
+        self.logger.debug("Private WebSocket callbacks RESUMED")

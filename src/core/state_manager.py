@@ -2,6 +2,8 @@
 
 import json
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
 from datetime import datetime
@@ -82,11 +84,32 @@ class StateManager:
                 # Legacy single-symbol format
                 all_state = symbol_state
 
-            with open(self.state_file, 'w') as f:
-                json.dump(all_state, f, indent=2)
+            # ATOMIC WRITE: Write to temp file first, then atomic rename
+            # This prevents partial writes if process crashes mid-write
+            temp_fd, temp_path = tempfile.mkstemp(
+                dir=self.state_file.parent,
+                prefix=f".{self.id_str}_state_",
+                suffix=".tmp"
+            )
 
-            self.logger.debug(f"State saved to {self.state_file}" +
-                            (f" for {self.symbol}" if self.symbol else ""))
+            try:
+                with os.fdopen(temp_fd, 'w') as f:
+                    json.dump(all_state, f, indent=2)
+
+                # Atomic rename (POSIX guarantees atomicity)
+                os.rename(temp_path, self.state_file)
+
+                self.logger.debug(f"✅ State saved atomically to {self.state_file}" +
+                                (f" for {self.symbol}" if self.symbol else ""))
+
+            except Exception as write_error:
+                # Cleanup temp file on error
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
+                raise write_error
 
         except Exception as e:
             self.logger.error(f"Failed to save state: {e}")

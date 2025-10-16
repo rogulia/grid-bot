@@ -364,3 +364,19 @@ class CalculationsMixin:
             self.logger.debug(f"[{self.symbol}] Could not check balance in calculate_reopen_size: {e}")
 
         return reopen_margin
+
+    def clear_reference_quantities(self):
+        """
+        Clear reference qty table - call when both sides fully closed
+
+        This allows fresh reference quantities after large price moves.
+        Optional optimization for long-term running bots.
+        """
+        with self._reference_qty_lock:
+            old_count = len(self._reference_qty_per_level)
+            self._reference_qty_per_level.clear()
+
+            if old_count > 0:
+                self.logger.info(
+                    f"[{self.symbol}] Cleared {old_count} reference quantities (both sides empty)"
+                )
