@@ -545,12 +545,14 @@ class BybitClient:
         symbol: str,
         category: str = "linear",
         limit: int = 50,
-        order_status: str = None
-    ) -> List[Dict]:
+        order_status: str = None,
+        cursor: str = None
+    ) -> Dict:
         """
-        Get order history (executed/cancelled orders)
+        Get order history (executed/cancelled orders) with pagination support
 
         This is used to reconstruct position history after bot restart.
+        Now supports cursor-based pagination for fetching >200 orders.
 
         Args:
             symbol: Trading symbol (e.g., 'SOLUSDT')
@@ -558,9 +560,14 @@ class BybitClient:
             limit: Number of records to retrieve (default: 50, max: 200)
             order_status: Filter by order status (e.g., 'Filled', 'Cancelled').
                          If None, returns all statuses.
+            cursor: Pagination cursor for fetching next page (optional)
 
         Returns:
-            List of order records, each containing:
+            Dictionary containing:
+                - list: List of order records (see below for fields)
+                - nextPageCursor: Cursor for next page (None if no more pages)
+
+            Order record fields:
                 - orderId: Order ID
                 - symbol: Trading symbol
                 - side: 'Buy' or 'Sell'
@@ -577,12 +584,18 @@ class BybitClient:
 
         Example:
             >>> # Get recent order history for SOLUSDT
-            >>> orders = client.get_order_history('SOLUSDT', limit=50)
+            >>> result = client.get_order_history('SOLUSDT', limit=50)
+            >>> orders = result['list']
+            >>> next_cursor = result['nextPageCursor']
             >>>
-            >>> # Get only filled orders (for position restoration)
-            >>> filled_orders = client.get_order_history('SOLUSDT', order_status='Filled', limit=200)
-            >>> for order in filled_orders:
-            ...     print(f"{order['side']} {order['qty']} @ {order['avgPrice']}")
+            >>> # Pagination example
+            >>> result = client.get_order_history('SOLUSDT', order_status='Filled', limit=200)
+            >>> all_orders = result['list']
+            >>> cursor = result['nextPageCursor']
+            >>> while cursor:
+            ...     result = client.get_order_history('SOLUSDT', order_status='Filled', limit=200, cursor=cursor)
+            ...     all_orders.extend(result['list'])
+            ...     cursor = result['nextPageCursor']
         """
         try:
             # Build params dict
@@ -596,20 +609,34 @@ class BybitClient:
             if order_status:
                 params['orderStatus'] = order_status
 
+            # Add cursor for pagination if specified
+            if cursor:
+                params['cursor'] = cursor
+
             response = self.session.get_order_history(**params)
 
             if response.get('retCode') == 0:
-                orders = response.get('result', {}).get('list', [])
+                result = response.get('result', {})
+                orders = result.get('list', [])
+                next_cursor = result.get('nextPageCursor', None)
+
                 status_msg = f" (status={order_status})" if order_status else ""
-                self.logger.debug(f"Retrieved {len(orders)} order history records for {symbol}{status_msg}")
-                return orders
+                cursor_msg = f", cursor={cursor[:8]}..." if cursor else ""
+                self.logger.debug(
+                    f"Retrieved {len(orders)} order history records for {symbol}{status_msg}{cursor_msg}"
+                )
+
+                return {
+                    'list': orders,
+                    'nextPageCursor': next_cursor
+                }
             else:
                 self.logger.error(f"Failed to get order history: {response}")
-                return []
+                return {'list': [], 'nextPageCursor': None}
 
         except Exception as e:
             self.logger.error(f"Error getting order history: {e}")
-            return []
+            return {'list': [], 'nextPageCursor': None}
 
     def get_transaction_log(
         self,

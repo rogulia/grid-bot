@@ -43,11 +43,39 @@ class RestorationMixin:
         # CRITICAL: Set current_price BEFORE any operations that need it (e.g., reserve check)
         self.current_price = current_price
 
+        # Build reference qty table BEFORE restoration (ensures perfect qty symmetry)
+        # This must be done BEFORE retry loop so reference table is available for all attempts
+        if not self.dry_run:
+            try:
+                # Fetch orders for BOTH sides to build comprehensive reference table
+                # We fetch for both sides separately and combine
+                all_orders_buy = self._fetch_all_orders_until_last_tp('Buy')
+                all_orders_sell = self._fetch_all_orders_until_last_tp('Sell')
+                combined_orders = all_orders_buy + all_orders_sell
+
+                self._build_reference_qty_table(combined_orders)
+            except Exception as e:
+                self.logger.warning(
+                    f"[{self.symbol}] Could not build reference qty table: {e}. "
+                    f"Will calculate qty from margin (may result in qty asymmetry)"
+                )
+                # Continue restoration - this is not critical
+
         # Retry loop - WebSocket updates during restore trigger re-sync
         max_retries = 3
+        max_total_time = TradingConstants.RESTORATION_TIMEOUT_SEC  # 30 seconds
         retry_count = 0
+        retry_start_time = time.time()
 
         while retry_count < max_retries:
+            # Check timeout
+            elapsed = time.time() - retry_start_time
+            if elapsed > max_total_time:
+                self.logger.error(
+                    f"❌ [{self.symbol}] Restoration timeout after {elapsed:.1f} seconds "
+                    f"(limit: {max_total_time}s). Retry count: {retry_count}/{max_retries}"
+                )
+                break  # Exit loop to handle timeout in error section below
             # Reset resync flag before each attempt
             with self._resync_lock:
                 self._needs_resync = False
@@ -224,8 +252,11 @@ class RestorationMixin:
             # Resync needed - increment retry count
             retry_count += 1
 
-        # If we exited loop due to max retries, create emergency stop with diagnostics
-        if retry_count >= max_retries:
+        # If we exited loop due to max retries OR timeout, create emergency stop with diagnostics
+        elapsed_total = time.time() - retry_start_time
+        timed_out = elapsed_total > max_total_time
+
+        if retry_count >= max_retries or timed_out:
             # Collect diagnostic data
             exchange_long_qty = 0.0
             exchange_short_qty = 0.0
@@ -270,11 +301,14 @@ class RestorationMixin:
             trigger_events = [t['event'] for t in self._resync_triggers]
             trigger_summary = ', '.join(trigger_events[-10:]) if trigger_events else 'none'
 
+            failure_reason = "timeout" if timed_out else f"{max_retries} retry attempts"
             reason = (
-                f"Failed to restore state after {max_retries} attempts due to continuous position changes.\n"
+                f"Failed to restore state after {failure_reason} due to continuous position changes.\n"
                 f"\n"
                 f"🔍 DIAGNOSTIC INFO:\n"
                 f"- Retry count: {retry_count}\n"
+                f"- Elapsed time: {elapsed_total:.1f}s (limit: {max_total_time}s)\n"
+                f"- Timed out: {timed_out}\n"
                 f"- WebSocket interruptions: {len(self._resync_triggers)}\n"
                 f"- Interruption events: {trigger_summary}\n"
                 f"- Exchange state: LONG={exchange_long_qty}@${exchange_long_avg:.4f}, "
@@ -345,25 +379,33 @@ class RestorationMixin:
                         )
                         return  # Exit early, let retry loop handle it
 
-                # FALLBACK: Order history restoration returned empty
-                # This happens when TP closed only part of position
-                # Use exchange position data directly
+                # GRID STATE RESET: Order history restoration returned empty
+                # This happens when:
+                # 1. TP closed only PART of position (orders from before TP remain)
+                # 2. Order history beyond pagination limit
+                #
+                # In both cases, we RESET grid state for safety and clarity:
+                # - Create single position at level 0 from exchange avgPrice
+                # - New grid will be built from this point forward
+                # - Previous grid levels are forgotten (this is safe after partial TP)
                 self.logger.warning(
-                    f"⚠️ [{self.symbol}] Order history restoration returned empty for {side}. "
-                    f"Using FALLBACK: creating single position from exchange data."
+                    f"🔄 [{self.symbol}] GRID STATE RESET for {side}: Order history incomplete. "
+                    f"Creating fresh grid from exchange data."
                 )
                 self.logger.info(
                     f"📊 [{self.symbol}] Exchange position: qty={exchange_qty}, avgPrice=${exchange_avg_price:.4f}"
                 )
 
                 # Create single position at grid level 0 from exchange data
-                # Grid level tracking will be lost, but position will be tracked correctly
-                # TP order will be created based on exchange avgPrice
                 positions = [(exchange_qty, exchange_avg_price, 0, None)]
 
                 self.logger.info(
-                    f"✅ [{self.symbol}] FALLBACK: Restored {side} as single level 0 with {exchange_qty} @ ${exchange_avg_price:.4f}"
+                    f"✅ [{self.symbol}] Grid reset complete: {side} position = {exchange_qty} @ ${exchange_avg_price:.4f} (level 0). "
+                    f"Previous grid levels lost (expected after partial TP). New grid starts here."
                 )
+
+            # Verify and cleanup order IDs (may be stale after restart)
+            positions = self._verify_and_cleanup_order_ids(positions)
 
             # Add each position to PositionManager
             for qty, price, grid_level, order_id in positions:
@@ -424,12 +466,255 @@ class RestorationMixin:
             )
             raise  # Fail-fast - don't continue with broken state
 
+    def _fetch_all_orders_until_last_tp(self, side: str) -> list:
+        """
+        Fetch order history with pagination until last TP found (or max pages reached)
+
+        This method uses cursor-based pagination to fetch orders beyond the 200 limit.
+        It stops when:
+        1. Last TP close is found (no need to fetch older orders)
+        2. Max pages reached (safety limit to prevent infinite loop)
+        3. No more pages available
+
+        Args:
+            side: Position side ('Buy' or 'Sell') - used to detect TP closes
+
+        Returns:
+            List of filled orders up to and including last TP (or all orders if no TP)
+        """
+        all_orders = []
+        cursor = None
+        page_count = 0
+        max_pages = TradingConstants.MAX_PAGINATION_PAGES
+
+        # Determine opposite side for TP detection
+        opposite_side = 'Sell' if side == 'Buy' else 'Buy'
+
+        self.logger.info(
+            f"[{self.symbol}] Fetching order history with pagination (max {max_pages} pages)..."
+        )
+
+        try:
+            while page_count < max_pages:
+                # Fetch one page
+                result = self.client.get_order_history(
+                    symbol=self.symbol,
+                    category=self.category,
+                    limit=TradingConstants.ORDER_HISTORY_LIMIT,
+                    order_status="Filled",
+                    cursor=cursor
+                )
+
+                orders = result.get('list', [])
+                cursor = result.get('nextPageCursor', None)
+                page_count += 1
+
+                if not orders:
+                    # No more orders
+                    self.logger.info(
+                        f"[{self.symbol}] No more orders on page {page_count}"
+                    )
+                    break
+
+                self.logger.debug(
+                    f"[{self.symbol}] Page {page_count}: fetched {len(orders)} orders"
+                )
+
+                all_orders.extend(orders)
+
+                # Check if last TP found in this batch
+                # TP close = opposite side + reduceOnly
+                tp_found = any(
+                    o.get('side') == opposite_side and o.get('reduceOnly')
+                    for o in orders
+                )
+
+                if tp_found:
+                    self.logger.info(
+                        f"[{self.symbol}] Last TP found on page {page_count} - stopping pagination"
+                    )
+                    break
+
+                # Check if more pages available
+                if not cursor:
+                    self.logger.info(
+                        f"[{self.symbol}] No more pages available after page {page_count}"
+                    )
+                    break
+
+            self.logger.info(
+                f"[{self.symbol}] Fetched total {len(all_orders)} filled orders across {page_count} page(s)"
+            )
+
+            return all_orders
+
+        except Exception as e:
+            self.logger.error(
+                f"[{self.symbol}] Error during paginated order history fetch: {e}",
+                exc_info=True
+            )
+            # Return what we have so far (partial data better than nothing)
+            if all_orders:
+                self.logger.warning(
+                    f"[{self.symbol}] Returning {len(all_orders)} orders fetched before error"
+                )
+                return all_orders
+            # No orders fetched - re-raise
+            raise
+
+    def _verify_and_cleanup_order_ids(self, positions: list) -> list:
+        """
+        Verify order IDs from restored positions still exist on exchange
+
+        After bot restart, order IDs from history may be stale (cancelled, expired, filled).
+        This method checks if orders still exist and clears invalid IDs.
+
+        Args:
+            positions: List of (qty, price, grid_level, order_id) tuples
+
+        Returns:
+            Cleaned positions with verified order_ids (None if stale)
+        """
+        if self.dry_run:
+            # Skip verification in dry run mode
+            return positions
+
+        verified_positions = []
+        stale_count = 0
+
+        for qty, price, grid_level, order_id in positions:
+            verified_id = order_id
+
+            if order_id:
+                # Check if order still exists via get_open_orders
+                # Note: This is a lightweight check - we just verify existence
+                try:
+                    open_orders = self.client.get_open_orders(
+                        symbol=self.symbol,
+                        category=self.category
+                    )
+
+                    # Check if this order_id exists in open orders
+                    order_exists = any(o.get('orderId') == order_id for o in open_orders)
+
+                    if not order_exists:
+                        self.logger.debug(
+                            f"[{self.symbol}] Order ID {order_id} for level {grid_level} "
+                            f"no longer exists - clearing"
+                        )
+                        verified_id = None
+                        stale_count += 1
+
+                except Exception as e:
+                    # If verification fails, clear ID as safety measure (fail-safe)
+                    self.logger.debug(
+                        f"[{self.symbol}] Could not verify order {order_id} for level {grid_level}: {e}"
+                    )
+                    verified_id = None
+                    stale_count += 1
+
+            verified_positions.append((qty, price, grid_level, verified_id))
+
+        if stale_count > 0:
+            self.logger.info(
+                f"[{self.symbol}] Cleaned {stale_count} stale order IDs from restored positions"
+            )
+        else:
+            self.logger.debug(
+                f"[{self.symbol}] All {len(positions)} order IDs verified successfully"
+            )
+
+        return verified_positions
+
+    def _build_reference_qty_table(self, all_orders: list):
+        """
+        Build reference qty table from order history BEFORE restoring positions
+
+        Analyzes filled orders for BOTH sides and extracts qty for each grid level.
+        This ensures perfect qty symmetry when restoring/reopening positions.
+
+        Args:
+            all_orders: Combined order history for both LONG and SHORT sides
+        """
+        # Process orders for both sides
+        for side in ['Buy', 'Sell']:
+            try:
+                # Determine positionIdx for this side
+                position_idx_str = '1' if side == 'Buy' else '2'
+                position_idx_int = 1 if side == 'Buy' else 2
+
+                # Determine opposite side for TP detection
+                opposite_side = 'Sell' if side == 'Buy' else 'Buy'
+
+                # Filter orders for this position index
+                position_orders = [
+                    o for o in all_orders
+                    if o.get('positionIdx') in [position_idx_str, position_idx_int]
+                    and o.get('orderStatus') == 'Filled'
+                ]
+
+                if not position_orders:
+                    continue
+
+                # Sort by creation time (oldest first)
+                position_orders.sort(key=lambda x: int(x.get('createdTime', 0)))
+
+                # Find last TP close
+                last_tp_idx = -1
+                for i, order in enumerate(position_orders):
+                    if order.get('side') == opposite_side and order.get('reduceOnly'):
+                        last_tp_idx = i
+
+                # Get orders after last TP (current position)
+                if last_tp_idx < 0:
+                    orders_after_tp = position_orders
+                else:
+                    orders_after_tp = position_orders[last_tp_idx + 1:]
+
+                # Filter for opening orders of correct side
+                opening_orders = [
+                    o for o in orders_after_tp
+                    if o.get('side') == side and not o.get('reduceOnly')
+                ]
+
+                # Extract qty for each grid level and save as reference
+                with self._reference_qty_lock:
+                    for i, order in enumerate(opening_orders):
+                        grid_level = i  # First order = level 0, second = level 1, etc.
+                        qty = float(order.get('cumExecQty', 0))
+
+                        if qty > 0:
+                            # Only save if not already set (first side wins)
+                            if grid_level not in self._reference_qty_per_level:
+                                self._reference_qty_per_level[grid_level] = qty
+                                self.logger.debug(
+                                    f"[{self.symbol}] Set reference qty for level {grid_level} "
+                                    f"from {side} order: {qty:.6f}"
+                                )
+
+            except Exception as e:
+                self.logger.debug(
+                    f"[{self.symbol}] Error building reference qty for {side}: {e}"
+                )
+                # Continue with other side
+
+        # Log summary
+        with self._reference_qty_lock:
+            if self._reference_qty_per_level:
+                self.logger.info(
+                    f"[{self.symbol}] Built reference qty table with {len(self._reference_qty_per_level)} levels"
+                )
+            else:
+                self.logger.debug(
+                    f"[{self.symbol}] No reference qty extracted from order history"
+                )
+
     def _restore_grid_levels_from_order_history(self, side: str, total_qty: float) -> list:
         """
         Restore grid levels from order history by analyzing filled orders
 
         Algorithm:
-        1. Get order history from exchange
+        1. Get order history from exchange (WITH PAGINATION)
         2. Find last reduce-only order (last TP close)
         3. All orders after that = current position orders
         4. First order = grid level 0, subsequent = grid levels 1, 2, 3...
@@ -442,18 +727,11 @@ class RestorationMixin:
             List of (qty, price, grid_level, order_id) tuples
         """
         try:
-            # Get order history from exchange
-            # Filter for Filled orders only to avoid cancelled TP orders cluttering history
-            # This dramatically increases effective history depth (200 filled vs 200 mixed)
-            orders = self.client.get_order_history(
-                symbol=self.symbol,
-                category=self.category,
-                limit=TradingConstants.ORDER_HISTORY_LIMIT,
-                order_status="Filled"
-            )
+            # Get order history with pagination
+            orders = self._fetch_all_orders_until_last_tp(side)
 
             self.logger.info(
-                f"[{self.symbol}] Retrieved {len(orders) if orders else 0} filled orders from history for {side} restoration"
+                f"[{self.symbol}] Retrieved {len(orders)} filled orders from history for {side} restoration"
             )
 
             if not orders:
@@ -461,13 +739,6 @@ class RestorationMixin:
                 raise RuntimeError(
                     f"[{self.symbol}] No order history available - cannot restore {side} position. "
                     f"Manual intervention required: close position on exchange and restart bot."
-                )
-
-            # Check if history may be truncated (reached API limit)
-            if len(orders) == TradingConstants.ORDER_HISTORY_LIMIT:
-                self.logger.warning(
-                    f"⚠️ [{self.symbol}] Retrieved exactly {TradingConstants.ORDER_HISTORY_LIMIT} orders - "
-                    f"history may be truncated. If restoration fails, consider closing positions manually."
                 )
 
             # DEBUG: Log ALL orders to see actual format
@@ -547,16 +818,20 @@ class RestorationMixin:
                 )
 
             if not current_position_orders:
-                # FALLBACK: No opening orders after last TP
-                # This happens when TP closed only PART of position
-                # Remaining position = orders opened BEFORE the TP close
-                # Use fallback: restore from exchange position data directly
+                # PARTIAL TP CLOSE or old orders before history limit
+                # This happens when:
+                # 1. TP closed only PART of position → remaining position = orders from BEFORE TP
+                # 2. All orders are beyond pagination limit
+                #
+                # In both cases, we CANNOT reliably reconstruct grid levels.
+                # SOLUTION: Reset grid state (create single level 0 from exchange data)
                 self.logger.warning(
-                    f"⚠️ [{self.symbol}] No {side} opening orders found after last TP in order history. "
-                    f"This means TP closed only part of position, or all orders are before TP. "
-                    f"Using FALLBACK: will restore from exchange position data."
+                    f"⚠️ [{self.symbol}] No {side} opening orders after last TP - "
+                    f"likely PARTIAL TP CLOSE or history truncated. "
+                    f"Grid levels CANNOT be reconstructed. "
+                    f"🔄 RESETTING grid state to level 0 (this is safe and expected)."
                 )
-                return []  # Signal to use fallback
+                return []  # Signal to reset grid state
 
             # Reconstruct grid levels
             positions = []

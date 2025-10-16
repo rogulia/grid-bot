@@ -19,6 +19,11 @@ class TradingConstants:
     ORDER_HISTORY_LIMIT = 200      # Max orders to fetch from history (Bybit API max limit)
     CLOSED_PNL_LIMIT = 20          # Max closed PnL records to fetch
     TRANSACTION_LOG_LIMIT = 50     # Max transaction log entries
+    MAX_PAGINATION_PAGES = 10      # Max pages to fetch when paginating (safety limit)
+
+    # === State Restoration ===
+
+    RESTORATION_TIMEOUT_SEC = 30   # Max time for state restoration (prevents hanging)
 
     # === Trading Tolerances ===
 
