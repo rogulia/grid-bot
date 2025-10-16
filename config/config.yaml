@@ -81,35 +81,43 @@ accounts:
         max_grid_levels_per_side: 10
 
   # Account 3 (ID: 3)
-  # - id: 3
-  #   name: "FLOKI Demo"
-  #   api_key_env: "3_BYBIT_API_KEY"
-  #   api_secret_env: "3_BYBIT_API_SECRET"
-  #   demo_trading: true
-  #   dry_run: false
+  - id: 3
+    name: "FLOKI Demo"
+    api_key_env: "3_BYBIT_API_KEY"
+    api_secret_env: "3_BYBIT_API_SECRET"
+    demo_trading: true
+    dry_run: false
 
-  #   # Per-account risk management
-  #   risk_management:
-  #     mm_rate_threshold: 90.0            # Emergency close when Account MM Rate >= this % (default: 90)
-  #     balance_buffer_percent: 15.0       # Safety buffer for reserve checks - % (default: 15)
+    # Per-account risk management
+    risk_management:
+      mm_rate_threshold: 90.0            # Emergency close when Account MM Rate >= this % (default: 90)
+      balance_buffer_percent: 15.0       # Safety buffer for reserve checks - % (default: 15)
 
-  #   strategies:
-  #     - symbol: "1000FLOKIUSDT"
-  #       category: "linear"
-  #       leverage: 50
-  #       initial_position_size_usd: 1.0
-  #       grid_step_percent: 1.0
-  #       averaging_multiplier: 2.0
-  #       take_profit_percent: 1.0
-  #       max_grid_levels_per_side: 10
-  #     - symbol: "FARTCOINUSDT"
-  #       category: "linear"
-  #       leverage: 75
-  #       initial_position_size_usd: 1.0
-  #       grid_step_percent: 1.0
-  #       averaging_multiplier: 2.0
-  #       take_profit_percent: 1.0
-  #       max_grid_levels_per_side: 10
+    strategies:
+      - symbol: "1000FLOKIUSDT"
+        category: "linear"
+        leverage: 50
+        initial_position_size_usd: 1.0
+        grid_step_percent: 1.0
+        averaging_multiplier: 2.0
+        take_profit_percent: 1.0
+        max_grid_levels_per_side: 10
+      - symbol: "FARTCOINUSDT"
+        category: "linear"
+        leverage: 75
+        initial_position_size_usd: 1.0
+        grid_step_percent: 1.0
+        averaging_multiplier: 2.0
+        take_profit_percent: 1.0
+        max_grid_levels_per_side: 10
+      - symbol: "GRASSUSDT"
+        category: "linear"
+        leverage: 50
+        initial_position_size_usd: 1.0
+        grid_step_percent: 1.0
+        averaging_multiplier: 2.0
+        take_profit_percent: 1.0
+        max_grid_levels_per_side: 10
 
   # Account 4 (ID: 4)
   - id: 4

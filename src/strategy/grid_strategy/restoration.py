@@ -332,9 +332,9 @@ class RestorationMixin:
             # Restore grid levels from order history
             positions = self._restore_grid_levels_from_order_history(side, exchange_qty)
 
-            # Check if restoration failed (empty positions + resync flag set)
-            # This allows retry loop to retry instead of throwing exception immediately
+            # Check if order history restoration returned empty (fallback needed)
             if not positions:
+                # Check if this is resync-triggered failure or fallback scenario
                 with self._resync_lock:
                     if self._needs_resync:
                         # Soft failure - validation detected incomplete restoration
@@ -344,13 +344,26 @@ class RestorationMixin:
                             f"(validation failed). Returning for retry..."
                         )
                         return  # Exit early, let retry loop handle it
-                    else:
-                        # Hard failure - no positions AND no resync flag
-                        # This means _restore_grid_levels_from_order_history() failed for other reason
-                        raise RuntimeError(
-                            f"[{self.symbol}] Failed to restore {side} grid levels - "
-                            f"no positions returned and no resync scheduled"
-                        )
+
+                # FALLBACK: Order history restoration returned empty
+                # This happens when TP closed only part of position
+                # Use exchange position data directly
+                self.logger.warning(
+                    f"⚠️ [{self.symbol}] Order history restoration returned empty for {side}. "
+                    f"Using FALLBACK: creating single position from exchange data."
+                )
+                self.logger.info(
+                    f"📊 [{self.symbol}] Exchange position: qty={exchange_qty}, avgPrice=${exchange_avg_price:.4f}"
+                )
+
+                # Create single position at grid level 0 from exchange data
+                # Grid level tracking will be lost, but position will be tracked correctly
+                # TP order will be created based on exchange avgPrice
+                positions = [(exchange_qty, exchange_avg_price, 0, None)]
+
+                self.logger.info(
+                    f"✅ [{self.symbol}] FALLBACK: Restored {side} as single level 0 with {exchange_qty} @ ${exchange_avg_price:.4f}"
+                )
 
             # Add each position to PositionManager
             for qty, price, grid_level, order_id in positions:
@@ -534,11 +547,16 @@ class RestorationMixin:
                 )
 
             if not current_position_orders:
-                # FAIL-FAST: Cannot restore without position orders
-                raise RuntimeError(
-                    f"[{self.symbol}] No {side} position orders found after last TP - cannot restore. "
-                    f"Manual intervention required: close position on exchange and restart bot."
+                # FALLBACK: No opening orders after last TP
+                # This happens when TP closed only PART of position
+                # Remaining position = orders opened BEFORE the TP close
+                # Use fallback: restore from exchange position data directly
+                self.logger.warning(
+                    f"⚠️ [{self.symbol}] No {side} opening orders found after last TP in order history. "
+                    f"This means TP closed only part of position, or all orders are before TP. "
+                    f"Using FALLBACK: will restore from exchange position data."
                 )
+                return []  # Signal to use fallback
 
             # Reconstruct grid levels
             positions = []

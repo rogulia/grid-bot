@@ -279,16 +279,21 @@ class BybitWebSocket:
             self.logger.info("Closing old connections...")
             if self.ws:
                 try:
+                    # Close WebSocket to prevent event loop leak
+                    # Call both close() and exit() for thorough cleanup
+                    self.ws.close()
                     self.ws.exit()
-                except:
-                    pass
+                except Exception as e:
+                    self.logger.debug(f"Error closing public WebSocket (non-critical): {e}")
                 self.ws = None
 
             if self.ws_private:
                 try:
+                    # Close private WebSocket to prevent event loop leak
+                    self.ws_private.close()
                     self.ws_private.exit()
-                except:
-                    pass
+                except Exception as e:
+                    self.logger.debug(f"Error closing private WebSocket (non-critical): {e}")
                 self.ws_private = None
 
             # Reconnect
@@ -403,6 +408,9 @@ class BybitWebSocket:
             # Stop public ticker WebSocket
             if self.ws:
                 try:
+                    # Close WebSocket to prevent event loop leak
+                    # Call both close() and exit() for thorough cleanup
+                    self.ws.close()
                     self.ws.exit()  # Properly close WebSocket connection
                     self.logger.info("Public WebSocket stopped")
                 except Exception as e:
@@ -413,6 +421,8 @@ class BybitWebSocket:
             # Stop private position WebSocket
             if self.ws_private:
                 try:
+                    # Close private WebSocket to prevent event loop leak
+                    self.ws_private.close()
                     self.ws_private.exit()  # Properly close WebSocket connection
                     self.logger.info("Private WebSocket stopped")
                 except Exception as e:

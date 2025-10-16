@@ -146,6 +146,15 @@ class BybitPrivateWebSocket:
 
             time.sleep(wait_time)
 
+            # Close old WebSocket before creating new one (prevent eventpoll leak)
+            if self.ws:
+                try:
+                    self.ws.close()
+                    self.logger.debug("Closed old WebSocket before reconnect")
+                except Exception as e:
+                    self.logger.debug(f"Error closing old WebSocket (non-critical): {e}")
+                self.ws = None
+
             try:
                 self.start()
             except Exception as e:
@@ -225,7 +234,14 @@ class BybitPrivateWebSocket:
         # Close WebSocket
         if self.ws:
             try:
-                # pybit WebSocket doesn't have explicit close, but cleanup
+                # Explicitly close WebSocket to prevent event loop leak
+                # pybit WebSocket wraps websocket-client which creates eventpoll descriptors
+                # Without explicit close, old event loops remain open causing descriptor leak
+                try:
+                    self.ws.close()  # Close the underlying WebSocket connection
+                except Exception as close_err:
+                    self.logger.debug(f"WebSocket close error (non-critical): {close_err}")
+
                 self._connected = False
                 self.ws = None
                 self.logger.info("✅ Private WebSocket stopped")
